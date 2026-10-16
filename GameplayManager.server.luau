@@ -1935,13 +1935,8 @@ placeEggInPen = function(player: Player, penInfo: PenInfo, eggData: any?, custom
 			if typeof(mult) ~= "number" or mult < 1 then mult = 1 end
 
 			if hatchLabel and hatchLabel.Parent then
-				if mult >= 50 then
-					hatchLabel.Text = string.format("🌙 50x FAST: %.1fs", remaining)
-					hatchLabel.TextColor3 = Color3.fromRGB(150, 220, 255)
-				else
-					hatchLabel.Text = string.format("🥚 Hatching: %ds", math.ceil(remaining))
-					hatchLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-				end
+				hatchLabel.Text = string.format("🥚 Hatching: %ds", math.max(0, math.ceil(remaining)))
+				hatchLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
 			end
 
 			task.wait(0.2)
