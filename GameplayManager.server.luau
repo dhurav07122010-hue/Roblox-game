@@ -111,6 +111,12 @@ if not upgradeDumbbellRemote then
 	upgradeDumbbellRemote.Parent = ReplicatedStorage
 end
 
+-- Cooldown and debounce trackers for client-triggered actions
+local lastUpgradeTime: { [Player]: number } = {}
+local lastPlaceTime: { [Player]: number } = {}
+local lastDropTime: { [Player]: number } = {}
+local lastPickupTime: { [Player]: number } = {}
+
 --------------------------------------------------------------------------------
 -- 1. NON-COLLIDING CHARACTERS SETUP (PHYSICSSERVICE)
 --------------------------------------------------------------------------------
@@ -784,6 +790,24 @@ local function setupPenTrainingArea(penInfo: PenInfo)
 			return
 		end
 
+		local char = player.Character
+		local root = char and char:FindFirstChild("HumanoidRootPart") :: BasePart?
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if not root or not hum or hum.Health <= 0 then return end
+
+		local dist = (root.Position - board.Position).Magnitude
+		if dist > 25 then
+			showFloatingFeedback(root.Position + Vector3.new(0, 2, 0), "Too far from upgrade sign!", Color3.fromRGB(255, 100, 100))
+			return
+		end
+
+		local now = os.clock()
+		local last = lastUpgradeTime[player] or 0
+		if (now - last) < 0.5 then
+			return
+		end
+		lastUpgradeTime[player] = now
+
 		local tier = penInfo.DumbbellTier or 1
 		if tier >= 3 then
 			showFloatingFeedback(board.Position + Vector3.new(0, 1.5, 0), "⭐ Dumbbell already at Max Level!", Color3.fromRGB(255, 200, 80))
@@ -794,6 +818,23 @@ local function setupPenTrainingArea(penInfo: PenInfo)
 		local nextProtoName = (tier == 1) and "dumbel2" or "dumbel3"
 		local nextName = (tier == 1) and "Medium Dumbbell" or "Heavy Dumbbell"
 		local nextGain = (tier == 1) and 5 or 20
+		local reqStrength = (tier == 1) and 25 or 100
+
+		local currentStrength = 0
+		if _G.PlayerData and _G.PlayerData.getStrength then
+			currentStrength = _G.PlayerData.getStrength(player)
+		else
+			local ls = player:FindFirstChild("leaderstats")
+			local s = ls and ls:FindFirstChild("Strength") :: IntValue?
+			if s then currentStrength = s.Value end
+		end
+
+		if currentStrength < reqStrength then
+			showFloatingFeedback(board.Position + Vector3.new(0, 1.5, 0),
+				string.format("❌ Need %d Strength to upgrade! (Have: %d)", reqStrength, currentStrength),
+				Color3.fromRGB(255, 75, 75))
+			return
+		end
 
 		local currentMoney = 0
 		if _G.PlayerData and _G.PlayerData.getMoney then
@@ -1292,6 +1333,16 @@ end
 
 -- Connect drop remote from client button or Q keybind
 dropEggRemote.OnServerEvent:Connect(function(player: Player)
+	if not playerCarriedEgg[player] then return end
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not hum or hum.Health <= 0 then return end
+
+	local now = os.clock()
+	local last = lastDropTime[player] or 0
+	if (now - last) < 0.3 then return end
+	lastDropTime[player] = now
+
 	dropCarriedEgg(player)
 end)
 
@@ -1501,6 +1552,20 @@ pickUpEgg = function(player: Player, worldEgg: Model)
 	local root = char:FindFirstChild("HumanoidRootPart") :: BasePart?
 	local hum = char:FindFirstChildOfClass("Humanoid")
 	if not root or not hum or hum.Health <= 0 then return end
+
+	local scale = worldEgg:GetAttribute("Scale") or 1.0
+	local eggPos = worldEgg:GetPivot().Position
+	local maxDist = 22 * math.max(1, scale)
+	if (root.Position - eggPos).Magnitude > maxDist then
+		return
+	end
+
+	local now = os.clock()
+	local last = lastPickupTime[player] or 0
+	if (now - last) < 0.35 then
+		return
+	end
+	lastPickupTime[player] = now
 
 	-- Egg size and weight attributes (No strength requirement - anyone can steal any egg!)
 	local tierName = worldEgg:GetAttribute("TierName") or "Anime Egg"
@@ -1894,11 +1959,37 @@ placeEggInPen = function(player: Player, penInfo: PenInfo, eggData: any?, custom
 end
 
 placeEggFromInventory = function(player: Player, penInfo: PenInfo): boolean
+	if penInfo.Owner ~= player then
+		showFloatingFeedback(penInfo.EggArea.Position, "This is not your pen!", Color3.fromRGB(255, 75, 75))
+		return false
+	end
+
+	local char = player.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart") :: BasePart?
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not root or not hum or hum.Health <= 0 then return false end
+
+	local dist = (root.Position - penInfo.EggArea.Position).Magnitude
+	local maxDist = math.max(30, penInfo.EggArea.Size.Magnitude / 2 + 10)
+	if dist > maxDist then
+		showFloatingFeedback(root.Position + Vector3.new(0, 2.5, 0), "Too far from pen platform!", Color3.fromRGB(255, 100, 100))
+		return false
+	end
+
+	local currentPlaced = getPlacedItemCount(penInfo)
+	if currentPlaced >= GameplayConfig.Eggs.MaxPlacedCapacity then
+		showFloatingFeedback(penInfo.EggArea.Position + Vector3.new(0, 2, 0),
+			"❌ Pen Full! (30/30 Eggs placed)", Color3.fromRGB(255, 75, 75))
+		return false
+	end
+
 	local eggTool: Tool? = nil
-	for _, item in ipairs(player.Backpack:GetChildren()) do
-		if item:IsA("Tool") and item:GetAttribute("IsAnimeEgg") == true then
-			eggTool = item
-			break
+	if player:FindFirstChild("Backpack") then
+		for _, item in ipairs(player.Backpack:GetChildren()) do
+			if item:IsA("Tool") and item:GetAttribute("IsAnimeEgg") == true then
+				eggTool = item
+				break
+			end
 		end
 	end
 	if not eggTool and player.Character then
@@ -1912,11 +2003,19 @@ placeEggFromInventory = function(player: Player, penInfo: PenInfo): boolean
 	if eggTool then
 		eggData = {
 			SizeTier = eggTool:GetAttribute("SizeTier") or "Small",
-			Scale = eggTool:GetAttribute("Scale") or 1.0,
+			Scale = tonumber(eggTool:GetAttribute("Scale")) or 1.0,
 			Name = eggTool:GetAttribute("TierName") or "Anime Egg",
 		}
-	elseif _G.PlayerData and _G.PlayerData.getEggInventoryCount and _G.PlayerData.getEggInventoryCount(player) > 0 then
-		eggData = _G.PlayerData.removeEggFromInventory(player)
+	elseif _G.PlayerData and _G.PlayerData.getEggInventory and #_G.PlayerData.getEggInventory(player) > 0 then
+		local inv = _G.PlayerData.getEggInventory(player)
+		local rawEgg = inv[#inv]
+		if rawEgg then
+			eggData = {
+				SizeTier = rawEgg.SizeTier or "Small",
+				Scale = tonumber(rawEgg.Scale) or 1.0,
+				Name = rawEgg.Name or "Anime Egg",
+			}
+		end
 	end
 
 	if not eggData then
@@ -1925,20 +2024,13 @@ placeEggFromInventory = function(player: Player, penInfo: PenInfo): boolean
 		return false
 	end
 
-	local currentPlaced = getPlacedItemCount(penInfo)
-	if currentPlaced >= GameplayConfig.Eggs.MaxPlacedCapacity then
-		showFloatingFeedback(penInfo.EggArea.Position + Vector3.new(0, 2, 0),
-			"❌ Pen Full! (30/30 Eggs placed)", Color3.fromRGB(255, 75, 75))
-		return false
-	end
-
 	local placed = placeEggInPen(player, penInfo, eggData)
 	if placed then
 		if eggTool then
 			eggTool:Destroy()
-			if _G.PlayerData and _G.PlayerData.removeEggFromInventory then
-				_G.PlayerData.removeEggFromInventory(player)
-			end
+		end
+		if _G.PlayerData and _G.PlayerData.removeEggFromInventory then
+			_G.PlayerData.removeEggFromInventory(player, eggData)
 		end
 		return true
 	end
@@ -1956,6 +2048,25 @@ placeEggAtLocationRemote.OnServerEvent:Connect(function(player: Player, hitPosit
 		return
 	end
 
+	local char = player.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart") :: BasePart?
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not root or not hum or hum.Health <= 0 then return end
+
+	local playerDist = (root.Position - pen.EggArea.Position).Magnitude
+	local maxAllowedDist = math.max(35, pen.EggArea.Size.Magnitude / 2 + 15)
+	if playerDist > maxAllowedDist then
+		showFloatingFeedback(root.Position + Vector3.new(0, 2.5, 0), "Too far from your pen!", Color3.fromRGB(255, 100, 100))
+		return
+	end
+
+	local now = os.clock()
+	local last = lastPlaceTime[player] or 0
+	if (now - last) < 0.35 then
+		return
+	end
+	lastPlaceTime[player] = now
+
 	local eggArea = pen.EggArea
 	local rel = eggArea.CFrame:PointToObjectSpace(hitPosition)
 	local halfX = (eggArea.Size.X / 2) + 2.5
@@ -1967,6 +2078,14 @@ placeEggAtLocationRemote.OnServerEvent:Connect(function(player: Player, hitPosit
 		return
 	end
 
+	-- Check pen capacity BEFORE consuming any egg
+	local currentPlaced = getPlacedItemCount(pen)
+	if currentPlaced >= GameplayConfig.Eggs.MaxPlacedCapacity then
+		showFloatingFeedback(eggArea.Position + Vector3.new(0, 2, 0),
+			"❌ Pen Full! (30/30 Eggs placed)", Color3.fromRGB(255, 75, 75))
+		return
+	end
+
 	-- Clamp within usable margins
 	local usableX = math.max(1, (eggArea.Size.X / 2) - 2.0)
 	local usableZ = math.max(1, (eggArea.Size.Z / 2) - 2.0)
@@ -1975,10 +2094,12 @@ placeEggAtLocationRemote.OnServerEvent:Connect(function(player: Player, hitPosit
 
 	-- Find egg tool or inventory egg
 	local eggTool: Tool? = nil
-	for _, item in ipairs(player.Backpack:GetChildren()) do
-		if item:IsA("Tool") and item:GetAttribute("IsAnimeEgg") == true then
-			eggTool = item
-			break
+	if player:FindFirstChild("Backpack") then
+		for _, item in ipairs(player.Backpack:GetChildren()) do
+			if item:IsA("Tool") and item:GetAttribute("IsAnimeEgg") == true then
+				eggTool = item
+				break
+			end
 		end
 	end
 	if not eggTool and player.Character then
@@ -1992,23 +2113,24 @@ placeEggAtLocationRemote.OnServerEvent:Connect(function(player: Player, hitPosit
 	if eggTool then
 		eggData = {
 			SizeTier = eggTool:GetAttribute("SizeTier") or "Small",
-			Scale = eggTool:GetAttribute("Scale") or 1.0,
+			Scale = tonumber(eggTool:GetAttribute("Scale")) or 1.0,
 			Name = eggTool:GetAttribute("TierName") or "Anime Egg",
 		}
-	elseif _G.PlayerData and _G.PlayerData.getEggInventoryCount and _G.PlayerData.getEggInventoryCount(player) > 0 then
-		eggData = _G.PlayerData.removeEggFromInventory(player)
+	elseif _G.PlayerData and _G.PlayerData.getEggInventory and #_G.PlayerData.getEggInventory(player) > 0 then
+		local inv = _G.PlayerData.getEggInventory(player)
+		local rawEgg = inv[#inv]
+		if rawEgg then
+			eggData = {
+				SizeTier = rawEgg.SizeTier or "Small",
+				Scale = tonumber(rawEgg.Scale) or 1.0,
+				Name = rawEgg.Name or "Anime Egg",
+			}
+		end
 	end
 
 	if not eggData then
 		showFloatingFeedback(eggArea.Position + Vector3.new(0, 2, 0),
 			"No eggs in inventory! Steal one from a zone!", Color3.fromRGB(255, 200, 80))
-		return
-	end
-
-	local currentPlaced = getPlacedItemCount(pen)
-	if currentPlaced >= GameplayConfig.Eggs.MaxPlacedCapacity then
-		showFloatingFeedback(eggArea.Position + Vector3.new(0, 2, 0),
-			"❌ Pen Full! (30/30 Eggs placed)", Color3.fromRGB(255, 75, 75))
 		return
 	end
 
@@ -2021,9 +2143,9 @@ placeEggAtLocationRemote.OnServerEvent:Connect(function(player: Player, hitPosit
 	if placed then
 		if eggTool then
 			eggTool:Destroy()
-			if _G.PlayerData and _G.PlayerData.removeEggFromInventory then
-				_G.PlayerData.removeEggFromInventory(player)
-			end
+		end
+		if _G.PlayerData and _G.PlayerData.removeEggFromInventory then
+			_G.PlayerData.removeEggFromInventory(player, eggData)
 		end
 	end
 end)
@@ -2360,6 +2482,10 @@ end
 Players.PlayerRemoving:Connect(function(player: Player)
 	stopPlayerTraining(player, false)
 	playerJumpExitTime[player] = nil
+	lastUpgradeTime[player] = nil
+	lastPlaceTime[player] = nil
+	lastDropTime[player] = nil
+	lastPickupTime[player] = nil
 	releasePlayerPen(player)
 end)
 
