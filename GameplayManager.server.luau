@@ -243,6 +243,9 @@ type PenInfo = {
 	OverheadGui: BillboardGui?,
 	OverheadAvatar: ImageLabel?,
 	OverheadLabel: TextLabel?,
+	HomeMarkerAnchor: BasePart?,
+	HomeMarkerGui: BillboardGui?,
+	HomeMarkerLabel: TextLabel?,
 	Slots: { [number]: { Type: string, Model: Model, HatchThread: thread? } },
 	FenceVisuals: Folder?,
 	VisualLevel: number?,
@@ -343,6 +346,69 @@ local function setupPenOverheadDisplay(penInfo: PenInfo)
 	penInfo.OverheadGui = bb
 	penInfo.OverheadAvatar = avatarImg
 	penInfo.OverheadLabel = label
+
+	-- Floating Home Marker: positioned at topY + 12 studs (floating cleanly above pen fence, below 50-stud overhead avatar)
+	local existingHomeAnchor = penInfo.Model:FindFirstChild("PenHomeMarkerAnchor") :: BasePart?
+	if existingHomeAnchor then
+		existingHomeAnchor:Destroy()
+	end
+
+	local homeAnchor = Instance.new("Part")
+	homeAnchor.Name = "PenHomeMarkerAnchor"
+	homeAnchor.Size = Vector3.new(0.5, 0.5, 0.5)
+	homeAnchor.CFrame = CFrame.new(cf.Position.X, topY + 12, cf.Position.Z)
+	homeAnchor.Transparency = 1
+	homeAnchor.Anchored = true
+	homeAnchor.CanCollide = false
+	homeAnchor.CanTouch = false
+	homeAnchor.CanQuery = false
+	homeAnchor.Parent = penInfo.Model
+
+	local homeGui = Instance.new("BillboardGui")
+	homeGui.Name = "PenHomeMarkerGui"
+	homeGui.Size = UDim2.fromOffset(140, 36)
+	homeGui.StudsOffset = Vector3.new(0, 0, 0)
+	homeGui.AlwaysOnTop = true
+	homeGui.MaxDistance = 250
+	homeGui.Adornee = homeAnchor
+	homeGui.Enabled = false -- Hidden when unowned
+	homeGui.Parent = homeAnchor
+
+	local homeBadge = Instance.new("Frame")
+	homeBadge.Name = "HomeBadge"
+	homeBadge.Size = UDim2.fromScale(1, 1)
+	homeBadge.BackgroundColor3 = Color3.fromRGB(35, 175, 75)
+	homeBadge.BackgroundTransparency = 0.15
+	homeBadge.Parent = homeGui
+
+	local badgeCorner = Instance.new("UICorner")
+	badgeCorner.CornerRadius = UDim.new(1, 0)
+	badgeCorner.Parent = homeBadge
+
+	local badgeStroke = Instance.new("UIStroke")
+	badgeStroke.Color = Color3.fromRGB(0, 0, 0)
+	badgeStroke.Thickness = 2.5
+	badgeStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	badgeStroke.Parent = homeBadge
+
+	local homeText = Instance.new("TextLabel")
+	homeText.Name = "HomeText"
+	homeText.Size = UDim2.fromScale(1, 1)
+	homeText.BackgroundTransparency = 1
+	homeText.Font = Enum.Font.FredokaOne
+	homeText.TextSize = 16
+	homeText.TextColor3 = Color3.fromRGB(255, 255, 255)
+	homeText.Text = "🏠 YOUR PEN"
+	homeText.Parent = homeBadge
+
+	local textStroke = Instance.new("UIStroke")
+	textStroke.Color = Color3.fromRGB(0, 0, 0)
+	textStroke.Thickness = 2.5
+	textStroke.Parent = homeText
+
+	penInfo.HomeMarkerAnchor = homeAnchor
+	penInfo.HomeMarkerGui = homeGui
+	penInfo.HomeMarkerLabel = homeText
 end
 
 local function updatePenOwnerDisplay(penInfo: PenInfo, owner: Player?)
@@ -411,6 +477,16 @@ local function updatePenOwnerDisplay(penInfo: PenInfo, owner: Player?)
 			penInfo.OverheadAvatar.Image = ""
 			penInfo.OverheadLabel.Text = ""
 			penInfo.OverheadGui.Enabled = false
+		end
+	end
+
+	if penInfo.HomeMarkerGui and penInfo.HomeMarkerLabel then
+		if owner then
+			penInfo.HomeMarkerLabel.Text = string.format("🏠 %s's Pen", owner.DisplayName)
+			penInfo.HomeMarkerGui.Enabled = true
+		else
+			penInfo.HomeMarkerLabel.Text = ""
+			penInfo.HomeMarkerGui.Enabled = false
 		end
 	end
 end
@@ -628,33 +704,45 @@ local function getPenUpgradeSignTemplate(level: number): Model?
 	return (proto and proto:IsA("Model")) and proto or nil
 end
 
--- Ensures SurfaceGui is cloned to Front, Back, Right, and Left so it is visible from both sides
-local function ensureMultiSidedGui(boardPart: BasePart)
-	local sg = boardPart:FindFirstChildWhichIsA("SurfaceGui")
-	if not sg then return end
-
-	local lateralFaces = {
-		Enum.NormalId.Front,
-		Enum.NormalId.Back,
-		Enum.NormalId.Right,
-		Enum.NormalId.Left,
-	}
-
-	for _, face in ipairs(lateralFaces) do
-		local found = false
-		for _, child in ipairs(boardPart:GetChildren()) do
-			if child:IsA("SurfaceGui") and child.Face == face then
-				found = true
-				break
-			end
-		end
-		if not found then
-			local cloneSg = sg:Clone()
-			cloneSg.Name = "SurfaceGui_" .. face.Name
-			cloneSg.Face = face
-			cloneSg.Parent = boardPart
+-- Ensures exactly one SurfaceGui exists on the sign board, placed strictly on the intended front face
+local function setupSingleFrontSurfaceGui(boardPart: BasePart, targetApproachDir: Vector3)
+	-- Remove any duplicate SurfaceGuis left from previous script runs or side clones
+	local guis: { SurfaceGui } = {}
+	for _, child in ipairs(boardPart:GetChildren()) do
+		if child:IsA("SurfaceGui") then
+			table.insert(guis, child)
 		end
 	end
+
+	if #guis == 0 then return end
+
+	-- Retain exactly one primary SurfaceGui and cleanly destroy all duplicate side GUIs
+	local primarySg = guis[1]
+	for i = 2, #guis do
+		guis[i]:Destroy()
+	end
+
+	-- Determine which lateral face normal of the board part most closely faces the approaching player
+	local cf = boardPart.CFrame
+	local faces = {
+		{ face = Enum.NormalId.Front, normal = cf.LookVector },
+		{ face = Enum.NormalId.Back,  normal = -cf.LookVector },
+		{ face = Enum.NormalId.Right, normal = cf.RightVector },
+		{ face = Enum.NormalId.Left,  normal = -cf.RightVector },
+	}
+
+	local bestFace = Enum.NormalId.Front
+	local bestDot = -math.huge
+	for _, candidate in ipairs(faces) do
+		local dot = candidate.normal:Dot(targetApproachDir)
+		if dot > bestDot then
+			bestDot = dot
+			bestFace = candidate.face
+		end
+	end
+
+	primarySg.Face = bestFace
+	primarySg.Enabled = true
 end
 
 -- Create the 10x10 stud Strength Training Area in front of each player's pen
@@ -840,11 +928,12 @@ local function setupPenTrainingArea(penInfo: PenInfo)
 
 		local lookCF = CFrame.lookAt(targetPos, Vector3.new(targetCenter.X, targetY, targetCenter.Z))
 		local rotCF = lookCF
-		if boardPart then
-			ensureMultiSidedGui(boardPart)
-		end
-
 		cloned:PivotTo(rotCF)
+
+		if boardPart then
+			local approachDir = (Vector3.new(targetCenter.X, targetY, targetCenter.Z) - targetPos).Unit
+			setupSingleFrontSurfaceGui(boardPart, approachDir)
+		end
 		cloned.Parent = trainingFolder
 		currentSignModel = cloned
 		penInfo.UpgradeSign = cloned
@@ -1365,7 +1454,7 @@ local function setupPenUpgradeGui(penInfo: PenInfo)
 		cloned:PivotTo(signPart.CFrame)
 
 		if boardPart then
-			ensureMultiSidedGui(boardPart)
+			setupSingleFrontSurfaceGui(boardPart, penInfo.ForwardDir)
 		end
 
 		cloned.Parent = penInfo.Model
@@ -2652,15 +2741,7 @@ placeEggFromInventory = function(player: Player, penInfo: PenInfo): boolean
 	end
 
 	local eggTool: Tool? = nil
-	if player:FindFirstChild("Backpack") then
-		for _, item in ipairs(player.Backpack:GetChildren()) do
-			if item:IsA("Tool") and (item:GetAttribute("IsAnimeEgg") == true or item.Name:lower():find("egg")) then
-				eggTool = item
-				break
-			end
-		end
-	end
-	if not eggTool and player.Character then
+	if player.Character then
 		for _, item in ipairs(player.Character:GetChildren()) do
 			if item:IsA("Tool") and (item:GetAttribute("IsAnimeEgg") == true or item.Name:lower():find("egg")) then
 				eggTool = item
@@ -2683,21 +2764,11 @@ placeEggFromInventory = function(player: Player, penInfo: PenInfo): boolean
 			Scale = tonumber(c.EggData and c.EggData.Scale) or 1.0,
 			Name = (c.EggData and c.EggData.Name) or "Anime Egg",
 		}
-	elseif _G.PlayerData and _G.PlayerData.getEggInventory and #_G.PlayerData.getEggInventory(player) > 0 then
-		local inv = _G.PlayerData.getEggInventory(player)
-		local rawEgg = inv[#inv]
-		if rawEgg then
-			eggData = {
-				SizeTier = rawEgg.SizeTier or "Small",
-				Scale = tonumber(rawEgg.Scale) or 1.0,
-				Name = rawEgg.Name or "Anime Egg",
-			}
-		end
 	end
 
 	if not eggData then
 		showFloatingFeedback(penInfo.EggArea.Position + Vector3.new(0, 2, 0),
-			"No eggs in inventory! Steal one from a zone!", Color3.fromRGB(255, 200, 80))
+			"Equip or carry an egg to place it!", Color3.fromRGB(255, 200, 80))
 		return false
 	end
 
@@ -2728,7 +2799,7 @@ placeEggFromInventory = function(player: Player, penInfo: PenInfo): boolean
 end
 
 -- Connect PlaceEggAtLocation RemoteEvent (Tap anywhere in pen to place egg!)
-placeEggAtLocationRemote.OnServerEvent:Connect(function(player: Player, hitPosition: any)
+placeEggAtLocationRemote.OnServerEvent:Connect(function(player: Player, hitPosition: any, clientTool: any?)
 	if typeof(hitPosition) ~= "Vector3" then return end
 
 	local pen = playerPenMap[player]
@@ -2752,9 +2823,10 @@ placeEggAtLocationRemote.OnServerEvent:Connect(function(player: Player, hitPosit
 		return
 	end
 
+	-- Per-player rate limit: 0.15s allows rapid intentional clicks without duplicate packets
 	local now = os.clock()
 	local last = lastPlaceTime[player] or 0
-	if (now - last) < 0.25 then
+	if (now - last) < 0.15 then
 		return
 	end
 	lastPlaceTime[player] = now
@@ -2778,22 +2850,25 @@ placeEggAtLocationRemote.OnServerEvent:Connect(function(player: Player, hitPosit
 	local currentPlaced = getPlacedItemCount(pen)
 	if currentPlaced >= GameplayConfig.Eggs.MaxPlacedCapacity then
 		showFloatingFeedback(eggArea.Position + Vector3.new(0, 2, 0),
-			"❌ Pen Full! (30/30 Eggs placed)", Color3.fromRGB(255, 75, 75))
+			string.format("❌ Pen Full! (%d/%d Eggs placed)", currentPlaced, GameplayConfig.Eggs.MaxPlacedCapacity),
+			Color3.fromRGB(255, 75, 75))
 		return
 	end
 
-	-- Find egg tool (equipped first, then backpack) or inventory egg or carried egg
+	-- Strictly identify the SELECTED egg:
+	-- 1. Check if clientTool is a valid Tool equipped in player.Character or inside Backpack
 	local eggTool: Tool? = nil
-	if player.Character then
-		for _, item in ipairs(player.Character:GetChildren()) do
-			if item:IsA("Tool") and (item:GetAttribute("IsAnimeEgg") == true or item.Name:lower():find("egg")) then
-				eggTool = item
-				break
+	if clientTool and typeof(clientTool) == "Instance" and clientTool:IsA("Tool") then
+		if clientTool.Parent == char or clientTool.Parent == player:FindFirstChild("Backpack") then
+			if clientTool:GetAttribute("IsAnimeEgg") == true or clientTool.Name:lower():find("egg") then
+				eggTool = clientTool
 			end
 		end
 	end
-	if not eggTool and player:FindFirstChild("Backpack") then
-		for _, item in ipairs(player.Backpack:GetChildren()) do
+
+	-- 2. Fallback to any egg tool currently equipped in player.Character
+	if not eggTool and char then
+		for _, item in ipairs(char:GetChildren()) do
 			if item:IsA("Tool") and (item:GetAttribute("IsAnimeEgg") == true or item.Name:lower():find("egg")) then
 				eggTool = item
 				break
@@ -2815,21 +2890,12 @@ placeEggAtLocationRemote.OnServerEvent:Connect(function(player: Player, hitPosit
 			Scale = tonumber(c.EggData and c.EggData.Scale) or 1.0,
 			Name = (c.EggData and c.EggData.Name) or "Anime Egg",
 		}
-	elseif _G.PlayerData and _G.PlayerData.getEggInventory and #_G.PlayerData.getEggInventory(player) > 0 then
-		local inv = _G.PlayerData.getEggInventory(player)
-		local rawEgg = inv[#inv]
-		if rawEgg then
-			eggData = {
-				SizeTier = rawEgg.SizeTier or "Small",
-				Scale = tonumber(rawEgg.Scale) or 1.0,
-				Name = rawEgg.Name or "Anime Egg",
-			}
-		end
 	end
 
+	-- If the player has neither an equipped egg tool nor a carried egg, refuse placement!
+	-- Never silently grab an unselected egg from inventory!
 	if not eggData then
-		showFloatingFeedback(eggArea.Position + Vector3.new(0, 2, 0),
-			"No eggs in inventory! Steal one from a zone!", Color3.fromRGB(255, 200, 80))
+		showFloatingFeedback(hitPosition, "Equip or carry an egg to place it!", Color3.fromRGB(255, 200, 80))
 		return
 	end
 

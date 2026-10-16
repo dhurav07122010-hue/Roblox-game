@@ -319,14 +319,53 @@ local function rebuildPenTrainingCache(pen: Model)
 	updatePenTrainingVisibility(pen)
 end
 
+local function updatePenHomeMarker(pen: Model)
+	local homeAnchor = pen:FindFirstChild("PenHomeMarkerAnchor")
+	local homeGui = homeAnchor and homeAnchor:FindFirstChild("PenHomeMarkerGui") :: BillboardGui?
+	if not homeGui then return end
+
+	local homeBadge = homeGui:FindFirstChild("HomeBadge") :: Frame?
+	local homeText = homeBadge and homeBadge:FindFirstChild("HomeText") :: TextLabel?
+	if not homeText or not homeBadge then return end
+
+	local ownerUserId = pen:GetAttribute("OwnerUserId") or 0
+	local ownerName = pen:GetAttribute("OwnerName") or ""
+	local myUserId = player.UserId
+
+	if ownerUserId == 0 and ownerName == "" then
+		homeGui.Enabled = false
+		return
+	end
+
+	local isOwner = (myUserId ~= 0 and ownerUserId ~= 0 and ownerUserId == myUserId) or (ownerName ~= "" and ownerName == player.Name)
+
+	if isOwner then
+		homeText.Text = "🏠 YOUR PEN"
+		homeBadge.BackgroundColor3 = Color3.fromRGB(46, 204, 113)
+		homeBadge.BackgroundTransparency = 0.1
+		homeGui.Size = UDim2.fromOffset(150, 38)
+		homeGui.Enabled = true
+	else
+		local displayName = ownerName ~= "" and ownerName or "Player"
+		homeText.Text = string.format("🏠 %s's Pen", displayName)
+		homeBadge.BackgroundColor3 = Color3.fromRGB(52, 73, 94)
+		homeBadge.BackgroundTransparency = 0.3
+		homeGui.Size = UDim2.fromOffset(140, 34)
+		homeGui.Enabled = true
+	end
+end
+
 local function hookPen(pen: Model)
 	rebuildPenTrainingCache(pen)
+	updatePenHomeMarker(pen)
 
 	pen:GetAttributeChangedSignal("OwnerUserId"):Connect(function()
 		updatePenTrainingVisibility(pen)
+		updatePenHomeMarker(pen)
 	end)
 	pen:GetAttributeChangedSignal("OwnerName"):Connect(function()
 		updatePenTrainingVisibility(pen)
+		updatePenHomeMarker(pen)
 	end)
 	pen:GetAttributeChangedSignal("IsTraining"):Connect(function()
 		updatePenTrainingVisibility(pen)
@@ -361,6 +400,11 @@ local function hookPen(pen: Model)
 	end
 
 	pen.ChildAdded:Connect(function(child)
+		if child.Name == "PenHomeMarkerAnchor" then
+			task.defer(function()
+				updatePenHomeMarker(pen)
+			end)
+		end
 		local nameL = child.Name:lower()
 		if child.Name == "StrengthTrainingArea" or child.Name == "TrainingPad"
 			or child.Name == "TrainingDumbbell" or child.Name == "TrainingUpgradeSign"
@@ -512,7 +556,7 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 end)
 
 --------------------------------------------------------------------------------
--- 8. TAP / CLICK ANYWHERE IN PEN TO PLACE EGG TOOL
+-- 8. UNIFIED TAP / CLICK TO PLACE EGG (DESKTOP & MOBILE CONSOLIDATED)
 --------------------------------------------------------------------------------
 local placeEggRemote = ReplicatedStorage:FindFirstChild("PlaceEggAtLocation") :: RemoteEvent?
 if not placeEggRemote then
@@ -521,15 +565,125 @@ if not placeEggRemote then
 	placeEggRemote.Parent = ReplicatedStorage
 end
 
+local function getEquippedEggTool(): Tool?
+	local char = player.Character
+	if char then
+		for _, child in ipairs(char:GetChildren()) do
+			if child:IsA("Tool") and (child:GetAttribute("IsAnimeEgg") == true or child.Name:lower():find("egg")) then
+				return child
+			end
+		end
+	end
+	return nil
+end
+
+local function isGuiAtScreenPoint(screenX: number, screenY: number): boolean
+	local pGui = player:FindFirstChild("PlayerGui")
+	if not pGui then return false end
+	local guis = pGui:GetGuiObjectsAtPosition(screenX, screenY)
+	for _, g in ipairs(guis) do
+		if g:IsA("GuiButton") or (g:IsA("Frame") and g.Active) or (g:IsA("TextBox") and g.Visible) then
+			return true
+		end
+	end
+	return false
+end
+
+local lastPlaceRequestTime = 0
+local CLIENT_PLACE_DEBOUNCE = 0.12 -- 120ms debounce consolidates any overlapping engine events into exactly one request
+
+local function requestPlaceEgg(screenX: number?, screenY: number?)
+	-- 1. Strictly verify player has an egg selected (equipped tool or carried egg)
+	-- Never fire placement requests or consume inventory when unequipped
+	local tool = getEquippedEggTool()
+	local isCarrying = (player:GetAttribute("CarryingEgg") == true)
+	if not tool and not isCarrying then
+		return
+	end
+
+	-- 2. Consolidate rapid overlapping input events
+	local now = os.clock()
+	if (now - lastPlaceRequestTime) < CLIENT_PLACE_DEBOUNCE then
+		return
+	end
+
+	-- 3. Screen coordinates & GUI blocking check
+	if not screenX or not screenY then
+		local mPos = UserInputService:GetMouseLocation()
+		screenX = mPos.X
+		screenY = mPos.Y
+	end
+
+	if isGuiAtScreenPoint(screenX, screenY) then
+		return
+	end
+
+	-- 4. Raycast to find 3D target position
+	local hitPos: Vector3? = nil
+	local camera = Workspace.CurrentCamera
+	if camera and screenX and screenY then
+		local unitRay = camera:ScreenPointToRay(screenX, screenY)
+		local rayParams = RaycastParams.new()
+		rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+		local filterList: { Instance } = {}
+		if player.Character then
+			table.insert(filterList, player.Character)
+		end
+		local nightBarriers = Workspace:FindFirstChild("NightBarriers") or Workspace:FindFirstChild("NightBarrier")
+		if nightBarriers then
+			table.insert(filterList, nightBarriers)
+		end
+		local barriers = Workspace:FindFirstChild("Barriers")
+		if barriers then
+			table.insert(filterList, barriers)
+		end
+		rayParams.FilterDescendantsInstances = filterList
+
+		local rayHit = Workspace:Raycast(unitRay.Origin, unitRay.Direction * 800, rayParams)
+		if rayHit then
+			hitPos = rayHit.Position
+		end
+	end
+
+	if not hitPos then
+		local mouse = player:GetMouse()
+		if mouse and mouse.Hit then
+			hitPos = mouse.Hit.Position
+		end
+	end
+
+	if not hitPos then
+		return
+	end
+
+	lastPlaceRequestTime = now
+	placeEggRemote:FireServer(hitPos, tool)
+end
+
+-- Connect Desktop Mouse Click
+local clientMouse = player:GetMouse()
+clientMouse.Button1Down:Connect(function()
+	local mPos = UserInputService:GetMouseLocation()
+	requestPlaceEgg(mPos.X, mPos.Y)
+end)
+
+-- Connect Mobile / Tablet Touch Tap (Single clean event upon tapping the screen)
+UserInputService.TouchTap:Connect(function(touchPositions, gameProcessed)
+	if gameProcessed then return end
+	local pos = touchPositions[1]
+	if pos then
+		requestPlaceEgg(pos.X, pos.Y)
+	end
+end)
+
+-- Hook equipped Tool Activated as a safety fallback for mobile tool tap buttons
 local function hookEggToolClient(item: Instance)
-	if item:IsA("Tool") and item:GetAttribute("IsAnimeEgg") == true then
+	if item:IsA("Tool") and (item:GetAttribute("IsAnimeEgg") == true or item.Name:lower():find("egg")) then
 		if not item:GetAttribute("ClientActivatedHooked") then
 			item:SetAttribute("ClientActivatedHooked", true)
 			item.Activated:Connect(function()
-				local mouse = player:GetMouse()
-				if mouse and mouse.Hit then
-					placeEggRemote:FireServer(mouse.Hit.Position)
-				end
+				requestPlaceEgg()
 			end)
 		end
 	end
@@ -561,71 +715,6 @@ end
 player.ChildAdded:Connect(function(c)
 	if c.Name == "Backpack" then
 		hookBackpackClient(c)
-	end
-end)
-
-local function isGuiAtScreenPoint(screenX: number, screenY: number): boolean
-	local pGui = player:FindFirstChild("PlayerGui")
-	if not pGui then return false end
-	local guis = pGui:GetGuiObjectsAtPosition(screenX, screenY)
-	for _, g in ipairs(guis) do
-		if g:IsA("GuiButton") or (g:IsA("Frame") and g.Active) or (g:IsA("TextBox") and g.Visible) then
-			return true
-		end
-	end
-	return false
-end
-
-local function firePlaceEggAtScreenPoint(screenX: number, screenY: number)
-	if isGuiAtScreenPoint(screenX, screenY) then
-		return
-	end
-
-	local hitPos: Vector3? = nil
-	local mouse = player:GetMouse()
-	if mouse and mouse.Hit then
-		hitPos = mouse.Hit.Position
-	elseif Workspace.CurrentCamera then
-		local unitRay = Workspace.CurrentCamera:ScreenPointToRay(screenX, screenY)
-		local rayParams = RaycastParams.new()
-		rayParams.FilterType = Enum.RaycastFilterType.Exclude
-		if player.Character then
-			rayParams.FilterDescendantsInstances = { player.Character }
-		end
-		local rayHit = Workspace:Raycast(unitRay.Origin, unitRay.Direction * 1000, rayParams)
-		if rayHit then
-			hitPos = rayHit.Position
-		end
-	end
-
-	if hitPos then
-		placeEggRemote:FireServer(hitPos)
-	end
-end
-
--- 1. Direct Mouse Button 1 Down (Reliable desktop world click without gameProcessed suppression)
-local clientMouse = player:GetMouse()
-clientMouse.Button1Down:Connect(function()
-	local mPos = UserInputService:GetMouseLocation()
-	if not isGuiAtScreenPoint(mPos.X, mPos.Y) then
-		if clientMouse.Hit then
-			placeEggRemote:FireServer(clientMouse.Hit.Position)
-		end
-	end
-end)
-
--- 2. Touch Tap (Reliable mobile / tablet tap)
-UserInputService.TouchTap:Connect(function(touchPositions, _gameProcessed)
-	local pos = touchPositions[1]
-	if pos then
-		firePlaceEggAtScreenPoint(pos.X, pos.Y)
-	end
-end)
-
--- 3. Touch InputBegan fallback
-UserInputService.InputBegan:Connect(function(input, _gameProcessed)
-	if input.UserInputType == Enum.UserInputType.Touch and input.Position then
-		firePlaceEggAtScreenPoint(input.Position.X, input.Position.Y)
 	end
 end)
 
