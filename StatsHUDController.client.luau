@@ -248,7 +248,8 @@ local penTrainingCache: { [Model]: { folder: Instance?, items: { Instance } } } 
 local function applyItemVisibility(desc: Instance, shouldBeVisible: boolean, isOwner: boolean)
 	if desc:IsA("BasePart") then
 		desc.Transparency = shouldBeVisible and 0 or 1
-		desc.CanCollide = shouldBeVisible and isOwner
+		local isPad = desc.Name == "TrainingPad"
+		desc.CanCollide = isPad and shouldBeVisible and isOwner
 	elseif desc:IsA("Decal") or desc:IsA("Texture") then
 		desc.Transparency = shouldBeVisible and 0 or 1
 	elseif desc:IsA("SelectionBox") then

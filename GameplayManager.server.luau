@@ -441,8 +441,6 @@ local function stopPlayerTraining(player: Player, jumped: boolean)
 			playerJumpExitTime[player] = tick()
 			local root = char:FindFirstChild("HumanoidRootPart") :: BasePart?
 			if root then
-				local impulseY = GameplayConfig.Training.ExitJumpImpulse or 38
-				root.AssemblyLinearVelocity = Vector3.new(root.AssemblyLinearVelocity.X, impulseY, root.AssemblyLinearVelocity.Z)
 				showFloatingFeedback(root.Position + Vector3.new(0, 2, 0), "💨 Jumped out!", Color3.fromRGB(255, 230, 80))
 			end
 		end
@@ -1457,7 +1455,7 @@ local function spawnSingleWorldEgg(sourceZone: string, spawnCF: CFrame, eggData:
 		if p:IsA("BasePart") then
 			p.Anchored = true
 			p.CanCollide = false
-			p.CanTouch = true
+			p.CanTouch = false
 			p.CanQuery = true
 		end
 	end
@@ -1483,7 +1481,7 @@ local function spawnSingleWorldEgg(sourceZone: string, spawnCF: CFrame, eggData:
 	rootHitbox.Anchored = true
 	rootHitbox.CanCollide = false
 	rootHitbox.CanQuery = true
-	rootHitbox.CanTouch = true
+	rootHitbox.CanTouch = false
 	rootHitbox.CFrame = newEgg:GetPivot()
 	rootHitbox.Parent = newEgg
 	newEgg.PrimaryPart = rootHitbox
@@ -1784,6 +1782,7 @@ end
 -- Pick up egg from Zone with size-based weight slowdown and FULL model welding
 pickUpEgg = function(player: Player, worldEgg: Model)
 	if not worldEgg or not worldEgg.Parent then return end
+	if worldEgg:GetAttribute("BeingPickedUp") then return end
 	if playerCarriedEgg[player] then
 		showFloatingFeedback(player.Character and player.Character:GetPivot().Position or Vector3.zero,
 			"Already carrying an egg!", Color3.fromRGB(255, 200, 80))
@@ -1809,6 +1808,7 @@ pickUpEgg = function(player: Player, worldEgg: Model)
 		return
 	end
 	lastPickupTime[player] = now
+	worldEgg:SetAttribute("BeingPickedUp", true)
 
 	-- Egg size and weight attributes (No strength requirement - anyone can steal any egg!)
 	local tierName = worldEgg:GetAttribute("TierName") or "Anime Egg"
