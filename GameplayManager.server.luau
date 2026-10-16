@@ -2360,8 +2360,31 @@ spawnZone1Eggs = function()
 		local eggsPerSpawn = GameplayConfig.Eggs.EggsPerSpawn or 10
 
 		for _, spawnPart in ipairs(eggSpawnParts) do
-			local zoneParent = spawnPart:FindFirstAncestorWhichIsA("Model")
-			local zoneName = (zoneParent and zoneParent.Name) or "Zone1"
+			-- Resolve the actual zone containing this spawn part instead of using
+			-- the first ancestor Model (which may be a decorative sub-model).
+			local zoneContainer: Instance? = nil
+			local zones = Workspace:FindFirstChild("Zones")
+			if zones then
+				for _, zone in ipairs(zones:GetChildren()) do
+					if spawnPart:IsDescendantOf(zone) then
+						zoneContainer = zone
+						break
+					end
+				end
+			end
+			local zoneName = zoneContainer and zoneContainer.Name or "Zone1"
+			local barrier: BasePart? = nil
+			local barrierInstance = zoneContainer and zoneContainer:FindFirstChild("NightBarrier", true)
+			if barrierInstance and barrierInstance:IsA("BasePart") then
+				barrier = barrierInstance
+			end
+			local zoneArea: BasePart? = nil
+			if zoneContainer then
+				local areaInstance = zoneContainer:FindFirstChild("ZoneArea", true) or zoneContainer:FindFirstChild("Area", true)
+				if areaInstance and areaInstance:IsA("BasePart") then
+					zoneArea = areaInstance
+				end
+			end
 
 			local existingCount = 0
 			for _, egg in ipairs(worldEggsFolder:GetChildren()) do
@@ -2375,14 +2398,25 @@ spawnZone1Eggs = function()
 				local tierKey, tierData = pickRandomEggTier()
 				local scale = tierData.Scale or 1.0
 				local eggExtents = baseExtents * scale
-				local spawnCF = getSpawnCFrameOnEggSpawn(spawnPart, eggExtents)
+				local spawnCF: CFrame? = getSpawnCFrameOnEggSpawn(spawnPart, eggExtents)
 
-				spawnSingleWorldEgg(zoneName, spawnCF, {
-					SizeTier = tierKey,
-					Scale = scale,
-					Name = tierData.Name,
-					SpeedMultiplier = tierData.SpeedMultiplier,
-				})
+				-- Named spawn parts used to bypass the fallback floor safety check.
+				-- If one overlaps a NightBarrier, move the egg to a safe floor point;
+				-- if no safe point can be found, skip this spawn rather than spawning
+				-- an egg on top of the barrier.
+				if barrier and isOverlappingNightBarrier(spawnCF.Position, eggExtents, barrier) then
+					local safePos = zoneArea and findSafeZone1FloorSpawn(zoneArea, barrier, eggExtents)
+					spawnCF = safePos and CFrame.new(safePos) or nil
+				end
+
+				if spawnCF then
+					spawnSingleWorldEgg(zoneName, spawnCF, {
+						SizeTier = tierKey,
+						Scale = scale,
+						Name = tierData.Name,
+						SpeedMultiplier = tierData.SpeedMultiplier,
+					})
+				end
 			end
 		end
 	else
