@@ -221,6 +221,7 @@ type PenInfo = {
 	DumbbellTier: number?,
 	UpgradeSign: Model?,
 	UpdateSignDisplay: (() -> ())?,
+	UpdatePenUpgradeDisplay: (() -> ())?,
 	PerformUpgrade: ((Player) -> ())?,
 	OverheadGui: BillboardGui?,
 	OverheadAvatar: ImageLabel?,
@@ -341,6 +342,10 @@ local function updatePenOwnerDisplay(penInfo: PenInfo, owner: Player?)
 				d:SetAttribute("OwnerUserId", ownerUserId)
 			end
 		end
+	end
+
+	if penInfo.UpdatePenUpgradeDisplay then
+		penInfo.UpdatePenUpgradeDisplay()
 	end
 
 	if penInfo.OverheadGui and penInfo.OverheadLabel and penInfo.OverheadAvatar then
@@ -618,7 +623,7 @@ local function setupPenTrainingArea(penInfo: PenInfo)
 			if p:IsA("BasePart") then
 				p.Anchored = true
 				p.CanCollide = false
-				p.Transparency = 1 -- Server creates invisible; client reveals only for owner or when in use
+				p.Transparency = 0 -- Keep the actual dumbbell visible to its owner
 			end
 		end
 
@@ -876,7 +881,7 @@ local function setupPenTrainingArea(penInfo: PenInfo)
 				if p:IsA("BasePart") then
 					p.Anchored = true
 					p.CanCollide = false
-					p.Transparency = 1
+					p.Transparency = 0
 				end
 			end
 			newDumbbell:PivotTo(CFrame.new(targetCenter.X, groundY + 0.6, targetCenter.Z))
@@ -995,6 +1000,159 @@ local function setupPenContainmentBarriers(penInfo: PenInfo)
 	folder.Parent = penInfo.Model
 end
 
+-- Add a clickable pen-upgrade GUI to the existing sign beside each pen.
+-- This only adds script-created UI/interactions; it does not reposition or rebuild the map.
+local PEN_UPGRADE_COSTS = { 5000, 25000, 75000, 150000, 300000 }
+
+local function setupPenUpgradeGui(penInfo: PenInfo)
+	local sign = penInfo.Sign
+	if not sign then
+		warn(string.format("[GameplayManager] Pen %d has no sign model; skipping pen upgrade GUI.", penInfo.Index))
+		return
+	end
+
+	local signPart: BasePart? = sign.PrimaryPart
+	if not signPart then
+		signPart = sign:FindFirstChildWhichIsA("BasePart", true)
+	end
+	if not signPart then
+		warn(string.format("[GameplayManager] Pen %d sign has no BasePart; skipping pen upgrade GUI.", penInfo.Index))
+		return
+	end
+
+	local existingGui = signPart:FindFirstChild("PenUpgradeGui")
+	if existingGui then existingGui:Destroy() end
+	local existingClick = signPart:FindFirstChild("PenUpgradeClickDetector")
+	if existingClick then existingClick:Destroy() end
+
+	local gui = Instance.new("SurfaceGui")
+	gui.Name = "PenUpgradeGui"
+	gui.Face = Enum.NormalId.Front
+	gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+	gui.PixelsPerStud = 32
+	gui.LightInfluence = 0
+	gui.AlwaysOnTop = true
+	gui.Parent = signPart
+
+	local frame = Instance.new("Frame")
+	frame.Name = "Panel"
+	frame.Size = UDim2.fromScale(1, 1)
+	frame.BackgroundColor3 = Color3.fromRGB(25, 29, 40)
+	frame.BorderSizePixel = 0
+	frame.Parent = gui
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(255, 195, 0)
+	stroke.Thickness = 3
+	stroke.Parent = frame
+
+	local title = Instance.new("TextLabel")
+	title.Name = "Title"
+	title.Size = UDim2.new(1, -8, 0.28, 0)
+	title.Position = UDim2.new(0, 4, 0.02, 0)
+	title.BackgroundTransparency = 1
+	title.Font = Enum.Font.FredokaOne
+	title.TextScaled = true
+	title.TextColor3 = Color3.fromRGB(255, 205, 55)
+	title.Text = "PEN UPGRADE"
+	title.Parent = frame
+
+	local levelLabel = Instance.new("TextLabel")
+	levelLabel.Name = "Level"
+	levelLabel.Size = UDim2.new(1, -8, 0.25, 0)
+	levelLabel.Position = UDim2.new(0, 4, 0.30, 0)
+	levelLabel.BackgroundTransparency = 1
+	levelLabel.Font = Enum.Font.FredokaOne
+	levelLabel.TextScaled = true
+	levelLabel.TextColor3 = Color3.new(1, 1, 1)
+	levelLabel.Parent = frame
+
+	local actionLabel = Instance.new("TextLabel")
+	actionLabel.Name = "Action"
+	actionLabel.Size = UDim2.new(1, -8, 0.34, 0)
+	actionLabel.Position = UDim2.new(0, 4, 0.57, 0)
+	actionLabel.BackgroundColor3 = Color3.fromRGB(46, 180, 92)
+	actionLabel.Font = Enum.Font.FredokaOne
+	actionLabel.TextScaled = true
+	actionLabel.TextColor3 = Color3.new(1, 1, 1)
+	actionLabel.Parent = frame
+	local actionCorner = Instance.new("UICorner")
+	actionCorner.CornerRadius = UDim.new(0, 6)
+	actionCorner.Parent = actionLabel
+
+	local hint = Instance.new("TextLabel")
+	hint.Name = "Hint"
+	hint.Size = UDim2.new(1, -8, 0.10, 0)
+	hint.Position = UDim2.new(0, 4, 0.90, 0)
+	hint.BackgroundTransparency = 1
+	hint.Font = Enum.Font.GothamBold
+	hint.TextScaled = true
+	hint.TextColor3 = Color3.fromRGB(210, 210, 210)
+	hint.Text = "CLICK SIGN TO UPGRADE"
+	hint.Parent = frame
+
+	local click = Instance.new("ClickDetector")
+	click.Name = "PenUpgradeClickDetector"
+	click.MaxActivationDistance = 16
+	click.Parent = signPart
+
+	local function refresh()
+		local level = (_G.PlayerData and _G.PlayerData.getPenUpgradeLevel and penInfo.Owner)
+			and _G.PlayerData.getPenUpgradeLevel(penInfo.Owner) or 0
+		level = math.clamp(tonumber(level) or 0, 0, 5)
+		if penInfo.Owner then
+			levelLabel.Text = string.format("LEVEL %d  •  PET LIMIT %d", level, 6 + level)
+		else
+			levelLabel.Text = "UNCLAIMED PEN"
+		end
+		if level >= 5 then
+			actionLabel.Text = "MAX LEVEL"
+			actionLabel.BackgroundColor3 = Color3.fromRGB(90, 100, 115)
+		else
+			actionLabel.Text = string.format("UPGRADE  $%s", tostring(PEN_UPGRADE_COSTS[level + 1]))
+			actionLabel.BackgroundColor3 = Color3.fromRGB(46, 180, 92)
+		end
+	end
+
+	local function performPenUpgrade(player: Player)
+		if penInfo.Owner ~= player then
+			showFloatingFeedback(signPart.Position, "This is not your pen!", Color3.fromRGB(255, 75, 75))
+			return
+		end
+		local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart") :: BasePart?
+		if not root or (root.Position - signPart.Position).Magnitude > 20 then return end
+		local level = _G.PlayerData and _G.PlayerData.getPenUpgradeLevel and _G.PlayerData.getPenUpgradeLevel(player) or 0
+		level = math.clamp(tonumber(level) or 0, 0, 5)
+		if level >= 5 then
+			showFloatingFeedback(signPart.Position, "Pen is already at maximum level!", Color3.fromRGB(255, 205, 55))
+			return
+		end
+		local cost = PEN_UPGRADE_COSTS[level + 1]
+		if not _G.PlayerData or not _G.PlayerData.getMoney or not _G.PlayerData.deductMoney or not _G.PlayerData.setPenUpgradeLevel then
+			warn("[GameplayManager] PlayerData pen upgrade API is unavailable.")
+			return
+		end
+		if _G.PlayerData.getMoney(player) < cost then
+			showFloatingFeedback(signPart.Position, string.format("Need $%d to upgrade your pen!", cost), Color3.fromRGB(255, 75, 75))
+			return
+		end
+		if not _G.PlayerData.deductMoney(player, cost) then return end
+		if not _G.PlayerData.setPenUpgradeLevel(player, level + 1) then
+			_G.PlayerData.addMoney(player, cost)
+			return
+		end
+		penInfo.Model:SetAttribute("PenUpgradeLevel", level + 1)
+		penInfo.Model:SetAttribute("EquippedPetLimit", 6 + level + 1)
+		refresh()
+		showFloatingFeedback(signPart.Position + Vector3.new(0, 2, 0),
+			string.format("PEN UPGRADED! Level %d • Pet limit %d", level + 1, 7 + level),
+			Color3.fromRGB(80, 255, 120))
+	end
+
+	click.MouseClick:Connect(performPenUpgrade)
+	penInfo.UpdatePenUpgradeDisplay = refresh
+	refresh()
+end
+
 local function discoverPens()
 	local spawnFolder = Workspace:WaitForChild("Spawn", 5)
 	if not spawnFolder then return end
@@ -1060,6 +1218,7 @@ local function discoverPens()
 	for _, p in ipairs(pensList) do
 		setupPenOverheadDisplay(p)
 		setupPenTrainingArea(p)
+		setupPenUpgradeGui(p)
 		setupPenContainmentBarriers(p)
 	end
 end
@@ -1264,19 +1423,12 @@ local function spawnSingleWorldEgg(sourceZone: string, spawnCF: CFrame, eggData:
 		pickUpEgg(player, newEgg)
 	end)
 
-	local function onEggTouched(hit: BasePart)
-		local char = hit.Parent
-		if not char then return end
-		local player = Players:GetPlayerFromCharacter(char)
-		if player and not playerCarriedEgg[player] then
-			pickUpEgg(player, newEgg)
-		end
-	end
-
-	rootHitbox.Touched:Connect(onEggTouched)
-	for _, p in ipairs(newEgg:GetDescendants()) do
-		if p:IsA("BasePart") and p ~= rootHitbox then
-			p.Touched:Connect(onEggTouched)
+	-- World eggs are collected ONLY by holding/triggering the ProximityPrompt.
+	-- Touching an egg must never steal it automatically.
+	rootHitbox.CanTouch = false
+	for _, part in ipairs(newEgg:GetDescendants()) do
+		if part:IsA("BasePart") then
+			part.CanTouch = false
 		end
 	end
 
