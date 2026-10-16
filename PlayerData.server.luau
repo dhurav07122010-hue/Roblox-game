@@ -55,52 +55,80 @@ end
 -- DATASTORE PERSISTENCE (STRING KEY: tostring(userId))
 --------------------------------------------------
 
+-- Track whether player cloud profile was loaded successfully (used to prevent overwrite on failure)
+local dataLoadedSuccessfully: { [Player]: boolean } = {}
+
 local function loadData(userId: number): (boolean, any)
 	local key = tostring(userId)
-	if SessionStore then
+	if not SessionStore then
+		warn(string.format("[PlayerData] DataStore unavailable. Checking session memory fallback for user %s (key: '%s')", tostring(userId), key))
+		local mem = sessionMemory[key]
+		return false, mem
+	end
+
+	local maxRetries = 3
+	local attempt = 0
+	local lastErr: any = nil
+
+	while attempt < maxRetries do
+		attempt += 1
 		local ok, res = pcall(function()
 			return SessionStore:GetAsync(key)
 		end)
 		if ok then
 			if type(res) == "table" then
-				print(string.format("[PlayerData] Successfully loaded profile for user %s (key: '%s')", tostring(userId), key))
+				print(string.format("[PlayerData] Successfully loaded profile for user %s (attempt %d, key: '%s')", tostring(userId), attempt, key))
 				return true, res
 			else
 				print(string.format("[PlayerData] No existing profile found for user %s (key: '%s') - initializing new player defaults", tostring(userId), key))
 				return true, nil
 			end
 		else
-			warn(string.format("[PlayerData] DataStore GetAsync ERROR for user %s (key: '%s'): %s", tostring(userId), key, tostring(res)))
-			local mem = sessionMemory[key]
-			if mem then
-				warn(string.format("[PlayerData] Recovered user %s data from server session memory fallback", key))
-				return false, mem
+			lastErr = res
+			warn(string.format("[PlayerData] DataStore GetAsync attempt %d failed for user %s (key: '%s'): %s", attempt, tostring(userId), key, tostring(res)))
+			if attempt < maxRetries then
+				task.wait(attempt * 1.5)
 			end
-			return false, nil
 		end
-	else
-		warn(string.format("[PlayerData] DataStore unavailable. Checking session memory fallback for user %s (key: '%s')", tostring(userId), key))
-		local mem = sessionMemory[key]
+	end
+
+	-- All cloud attempts failed! Check session memory fallback
+	local mem = sessionMemory[key]
+	if mem then
+		warn(string.format("[PlayerData] Recovered user %s data from server session memory fallback", key))
 		return false, mem
 	end
+
+	return false, nil
 end
 
 local function saveData(userId: number, saved: any): boolean
 	local key = tostring(userId)
 	local saveSuccess = false
+
 	if SessionStore then
-		local ok, err = pcall(function()
-			SessionStore:SetAsync(key, saved)
-		end)
-		if ok then
-			print(string.format("[PlayerData] Successfully saved profile for user %s (key: '%s')", tostring(userId), key))
-			saveSuccess = true
-		else
-			warn(string.format("[PlayerData] DataStore SetAsync ERROR for user %s (key: '%s'): %s", tostring(userId), key, tostring(err)))
+		local maxRetries = 2
+		local attempt = 0
+		while attempt < maxRetries do
+			attempt += 1
+			local ok, err = pcall(function()
+				SessionStore:SetAsync(key, saved)
+			end)
+			if ok then
+				print(string.format("[PlayerData] Successfully saved profile for user %s (key: '%s')", tostring(userId), key))
+				saveSuccess = true
+				break
+			else
+				warn(string.format("[PlayerData] DataStore SetAsync attempt %d failed for user %s (key: '%s'): %s", attempt, tostring(userId), key, tostring(err)))
+				if attempt < maxRetries then
+					task.wait(1.5)
+				end
+			end
 		end
 	else
 		warn(string.format("[PlayerData] DataStore unavailable (API access disabled). Saving user %s data to session memory only", key))
 	end
+
 	sessionMemory[key] = saved
 	return saveSuccess
 end
@@ -471,20 +499,55 @@ local function serializeEggInventory(player: Player): { any }
 end
 
 --------------------------------------------------
--- PLAYER LIFECYCLE
+-- PLAYER LIFECYCLE & PERSISTENCE SAFETY
 --------------------------------------------------
+
+local function savePlayerData(player: Player): boolean
+	local d = data[player]
+	if not d then return false end
+
+	-- CRITICAL: Refuse to overwrite valid cloud data if load had failed
+	if dataLoadedSuccessfully[player] == false then
+		warn(string.format("[PlayerData] OVERWRITE PROTECTION ACTIVE for user %s (%d). Skipping DataStore save to prevent progress wipe.", player.Name, player.UserId))
+		return false
+	end
+
+	local arr = {}
+	for id in pairs(d.OwnedTrails) do table.insert(arr, id) end
+	local eggList = serializeEggInventory(player)
+	return saveData(player.UserId, {
+		Strength = d.Strength,
+		Money = d.Money,
+		PenUpgradeLevel = d.PenUpgradeLevel,
+		SpeedTier = d.SpeedTier,
+		Trail = d.Trail,
+		OwnedTrails = arr,
+		EggInventory = eggList,
+	})
+end
 
 local function onPlayerAdded(player: Player)
 	local ok, loaded = loadData(player.UserId)
-	if ok and loaded and type(loaded) == "table" then
-		data[player] = sanitize(loaded)
-	elseif not ok and loaded and type(loaded) == "table" then
-		data[player] = sanitize(loaded)
-	else
-		if not ok then
-			warn(string.format("[PlayerData] NOTICE: DataStore load failed for user %s (%d). Applying default session profile.", player.Name, player.UserId))
+	if ok then
+		dataLoadedSuccessfully[player] = true
+		if loaded and type(loaded) == "table" then
+			data[player] = sanitize(loaded)
+		else
+			-- Genuinely new player with no prior cloud profile
+			data[player] = sanitize(DEFAULT_DATA)
 		end
-		data[player] = sanitize(DEFAULT_DATA)
+	else
+		-- Cloud load failed!
+		if loaded and type(loaded) == "table" then
+			-- Successfully recovered from server session memory
+			dataLoadedSuccessfully[player] = true
+			data[player] = sanitize(loaded)
+		else
+			-- Complete DataStore failure! Enable overwrite protection
+			dataLoadedSuccessfully[player] = false
+			data[player] = sanitize(DEFAULT_DATA)
+			warn(string.format("[PlayerData] CRITICAL: DataStore load failed for user %s (%d). Overwrite protection active - cloud saving disabled for this session.", player.Name, player.UserId))
+		end
 	end
 
 	local strength, money = setupLeaderstats(player)
@@ -522,39 +585,32 @@ for _, p in Players:GetPlayers() do
 end
 
 local function onPlayerRemoving(player: Player)
-	local d = data[player]
-	if d then
-		local arr = {}
-		for id in pairs(d.OwnedTrails) do table.insert(arr, id) end
-		local eggList = serializeEggInventory(player)
-		saveData(player.UserId, {
-			Strength = d.Strength,
-			Money = d.Money,
-			PenUpgradeLevel = d.PenUpgradeLevel,
-			SpeedTier = d.SpeedTier,
-			Trail = d.Trail,
-			OwnedTrails = arr,
-			EggInventory = eggList,
-		})
-	end
+	savePlayerData(player)
 	data[player] = nil
+	dataLoadedSuccessfully[player] = nil
 end
 Players.PlayerRemoving:Connect(onPlayerRemoving)
 
 game:BindToClose(function()
-	for p, d in pairs(data) do
-		local arr = {}
-		for id in pairs(d.OwnedTrails) do table.insert(arr, id) end
-		local eggList = serializeEggInventory(p)
-		saveData(p.UserId, {
-			Strength = d.Strength,
-			Money = d.Money,
-			PenUpgradeLevel = d.PenUpgradeLevel,
-			SpeedTier = d.SpeedTier,
-			Trail = d.Trail,
-			OwnedTrails = arr,
-			EggInventory = eggList,
-		})
+	for p, _ in pairs(data) do
+		savePlayerData(p)
+	end
+end)
+
+--------------------------------------------------
+-- RELIABLE AUTOSAVE SYSTEM (EVERY 120s STAGGERED)
+--------------------------------------------------
+task.spawn(function()
+	while true do
+		task.wait(120)
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p.Parent and data[p] and dataLoadedSuccessfully[p] ~= false then
+				task.spawn(function()
+					savePlayerData(p)
+				end)
+				task.wait(0.5) -- Stagger saves across players to stay well within DataStore budget
+			end
+		end
 	end
 end)
 
@@ -698,6 +754,10 @@ _G.PlayerData = {
 	end,
 	createEggTool = createEggTool,
 	restoreEggTools = restoreEggTools,
+	savePlayerData = savePlayerData,
+	isDataLoaded = function(player: Player): boolean
+		return dataLoadedSuccessfully[player] == true
+	end,
 }
 
 print("[PlayerData] Initialized with Strength, Money, Speed, and Pen Level systems active.")
