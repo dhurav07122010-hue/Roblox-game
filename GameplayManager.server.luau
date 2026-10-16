@@ -129,9 +129,16 @@ local lastPickupTime: { [Player]: number } = {}
 -- 1. NON-COLLIDING CHARACTERS SETUP (PHYSICSSERVICE)
 --------------------------------------------------------------------------------
 local CHAR_COLLISION_GROUP = "GameCharacters"
+local PET_COLLISION_GROUP = "GamePets"
 pcall(function()
 	PhysicsService:RegisterCollisionGroup(CHAR_COLLISION_GROUP)
+	PhysicsService:RegisterCollisionGroup(PET_COLLISION_GROUP)
+	-- Player characters do not collide with other characters
 	PhysicsService:CollisionGroupSetCollidable(CHAR_COLLISION_GROUP, CHAR_COLLISION_GROUP, false)
+	-- Pets do not collide with player characters or other pets
+	PhysicsService:CollisionGroupSetCollidable(PET_COLLISION_GROUP, CHAR_COLLISION_GROUP, false)
+	PhysicsService:CollisionGroupSetCollidable(CHAR_COLLISION_GROUP, PET_COLLISION_GROUP, false)
+	PhysicsService:CollisionGroupSetCollidable(PET_COLLISION_GROUP, PET_COLLISION_GROUP, false)
 end)
 
 local function makeCharacterNonColliding(char: Model)
@@ -223,11 +230,13 @@ type PenInfo = {
 	Sign: Model?,
 	Owner: Player?,
 	ForwardDir: Vector3,
+	EntranceCenter: Vector3?,
 	TrainingArea: Model?,
 	TrainingPad: BasePart?,
 	TrainingDumbbell: Model?,
 	DumbbellTier: number?,
 	UpgradeSign: Model?,
+	PenSign: Model?,
 	UpdateSignDisplay: (() -> ())?,
 	UpdatePenUpgradeDisplay: (() -> ())?,
 	PerformUpgrade: ((Player) -> ())?,
@@ -235,10 +244,16 @@ type PenInfo = {
 	OverheadAvatar: ImageLabel?,
 	OverheadLabel: TextLabel?,
 	Slots: { [number]: { Type: string, Model: Model, HatchThread: thread? } },
+	FenceVisuals: Folder?,
+	VisualLevel: number?,
+	DefaultFences: Folder?,
 }
 
 local pensList: { PenInfo } = {}
 local playerPenMap: { [Player]: PenInfo } = {}
+
+local applyPenVisualLevel: (PenInfo, number) -> ()
+local configurePetCollisions: (Model) -> ()
 
 -- Clean up legacy billboard attached to physical signs
 local function cleanupPhysicalSign(signModel: Model?)
@@ -365,6 +380,16 @@ local function updatePenOwnerDisplay(penInfo: PenInfo, owner: Player?)
 		penInfo.UpgradeSign:SetAttribute("OwnerUserId", ownerUserId)
 		penInfo.UpgradeSign:SetAttribute("OwnerName", ownerName)
 		for _, d in ipairs(penInfo.UpgradeSign:GetDescendants()) do
+			if d:IsA("BasePart") then
+				d:SetAttribute("OwnerUserId", ownerUserId)
+				d:SetAttribute("OwnerName", ownerName)
+			end
+		end
+	end
+	if penInfo.PenSign then
+		penInfo.PenSign:SetAttribute("OwnerUserId", ownerUserId)
+		penInfo.PenSign:SetAttribute("OwnerName", ownerName)
+		for _, d in ipairs(penInfo.PenSign:GetDescendants()) do
 			if d:IsA("BasePart") then
 				d:SetAttribute("OwnerUserId", ownerUserId)
 				d:SetAttribute("OwnerName", ownerName)
@@ -567,19 +592,88 @@ local function getDumbbellPrototype(protoName: string): Model?
 	return (proto and proto:IsA("Model")) and proto or nil
 end
 
+local function getDumbbellUpgradeSignTemplate(tier: number): Model?
+	local targetName = "dumbel up" .. tier
+	local proto = Workspace:FindFirstChild(targetName) or ServerStorage:FindFirstChild(targetName)
+	if not proto then
+		for _, child in ipairs(Workspace:GetChildren()) do
+			if child:IsA("Model") and child.Name:lower() == targetName:lower() then
+				return child
+			end
+		end
+		for _, child in ipairs(ServerStorage:GetChildren()) do
+			if child:IsA("Model") and child.Name:lower() == targetName:lower() then
+				return child
+			end
+		end
+	end
+	return (proto and proto:IsA("Model")) and proto or nil
+end
+
+local function getPenUpgradeSignTemplate(level: number): Model?
+	local targetName = "pen up" .. level
+	local proto = Workspace:FindFirstChild(targetName) or ServerStorage:FindFirstChild(targetName)
+	if not proto then
+		for _, child in ipairs(Workspace:GetChildren()) do
+			if child:IsA("Model") and child.Name:lower() == targetName:lower() then
+				return child
+			end
+		end
+		for _, child in ipairs(ServerStorage:GetChildren()) do
+			if child:IsA("Model") and child.Name:lower() == targetName:lower() then
+				return child
+			end
+		end
+	end
+	return (proto and proto:IsA("Model")) and proto or nil
+end
+
+-- Ensures SurfaceGui is cloned to Front, Back, Right, and Left so it is visible from both sides
+local function ensureMultiSidedGui(boardPart: BasePart)
+	local sg = boardPart:FindFirstChildWhichIsA("SurfaceGui")
+	if not sg then return end
+
+	local lateralFaces = {
+		Enum.NormalId.Front,
+		Enum.NormalId.Back,
+		Enum.NormalId.Right,
+		Enum.NormalId.Left,
+	}
+
+	for _, face in ipairs(lateralFaces) do
+		local found = false
+		for _, child in ipairs(boardPart:GetChildren()) do
+			if child:IsA("SurfaceGui") and child.Face == face then
+				found = true
+				break
+			end
+		end
+		if not found then
+			local cloneSg = sg:Clone()
+			cloneSg.Name = "SurfaceGui_" .. face.Name
+			cloneSg.Face = face
+			cloneSg.Parent = boardPart
+		end
+	end
+end
+
 -- Create the 10x10 stud Strength Training Area in front of each player's pen
 local function setupPenTrainingArea(penInfo: PenInfo)
 	local eggArea = penInfo.EggArea
 	local sign = penInfo.Sign
 	if not eggArea or not sign then return end
 
-	local signPos = sign:GetPivot().Position
+	local signPart = (sign and sign:FindFirstChildWhichIsA("BasePart", true))
+	local signPos = signPart and signPart.Position or sign:GetPivot().Position
 	local eggPos = eggArea.Position
 
 	-- Forward vector pointing out through the pen entrance
-	local dir = Vector3.new(signPos.X - eggPos.X, 0, signPos.Z - eggPos.Z)
-	local forward = dir.Magnitude > 0.1 and dir.Unit or Vector3.new(0, 0, 1)
-	penInfo.ForwardDir = forward
+	local forward = penInfo.ForwardDir
+	if not forward or forward.Magnitude < 0.1 then
+		local dir = Vector3.new(signPos.X - eggPos.X, 0, signPos.Z - eggPos.Z)
+		forward = dir.Magnitude > 0.1 and dir.Unit or Vector3.new(0, 0, 1)
+		penInfo.ForwardDir = forward
+	end
 
 	-- Place training pad approximately 8 studs in front of the sign
 	local targetCenter = signPos + forward * 8
@@ -684,183 +778,109 @@ local function setupPenTrainingArea(penInfo: PenInfo)
 	penInfo.DumbbellTier = 1
 	penInfo.Model:SetAttribute("DumbbellTier", 1)
 
-	-- Physical 3D Dumbbell Upgrade Sign placed beside the training pad
+	-- Physical 3D Dumbbell Upgrade Sign placed beside the training pad using templates (dumbel up1 for Level 1->2, dumbel up2 for Level 2->3)
 	local rightDir = Vector3.new(forward.Z, 0, -forward.X).Unit
 	local signBasePos = targetCenter + rightDir * 6.5
 
-	local upgradeSign = Instance.new("Model")
-	upgradeSign.Name = "TrainingUpgradeSign"
-	upgradeSign:SetAttribute("OwnerUserId", penInfo.Owner and penInfo.Owner.UserId or 0)
-	upgradeSign.Parent = trainingFolder
-	penInfo.UpgradeSign = upgradeSign
+	local currentSignModel: Model? = nil
+	local dumbbellPrompt: ProximityPrompt? = nil
+	local performDumbbellUpgrade: (Player) -> () -- forward declaration
 
-	local post = Instance.new("Part")
-	post.Name = "TrainingSignPost"
-	post.Size = Vector3.new(0.8, 5.5, 0.8)
-	post.CFrame = CFrame.new(signBasePos.X, groundY + 2.75, signBasePos.Z)
-	post.Material = Enum.Material.Wood
-	post.Color = Color3.fromRGB(115, 75, 45)
-	post.Anchored = true
-	post.CanCollide = true
-	post.Transparency = 0
-	post:SetAttribute("OwnerUserId", penInfo.Owner and penInfo.Owner.UserId or 0)
-	post.Parent = upgradeSign
+	local function setupDumbbellUpgradeSign(tier: number)
+		if currentSignModel and currentSignModel.Parent then
+			currentSignModel:Destroy()
+			currentSignModel = nil
+		end
 
-	local board = Instance.new("Part")
-	board.Name = "TrainingSignBoard"
-	board.Size = Vector3.new(4.6, 3.2, 0.5)
-	board.CFrame = CFrame.lookAt(Vector3.new(signBasePos.X, groundY + 4.5, signBasePos.Z), Vector3.new(targetCenter.X, groundY + 4.5, targetCenter.Z))
-	board.Material = Enum.Material.SmoothPlastic
-	board.Color = Color3.fromRGB(24, 28, 36)
-	board.Anchored = true
-	board.CanCollide = true
-	board.Transparency = 0
-	board:SetAttribute("OwnerUserId", penInfo.Owner and penInfo.Owner.UserId or 0)
-	board.Parent = upgradeSign
+		local template = getDumbbellUpgradeSignTemplate(tier)
+		if not template then
+			template = getDumbbellUpgradeSignTemplate(1)
+		end
 
-	local clickDetector = Instance.new("ClickDetector")
-	clickDetector.Name = "UpgradeClickDetector"
-	clickDetector.MaxActivationDistance = 14
-	clickDetector.Parent = board
+		if not template then
+			warn("[GameplayManager] No dumbbell upgrade sign template found for tier " .. tostring(tier))
+			return
+		end
 
-	local postClickDetector = Instance.new("ClickDetector")
-	postClickDetector.Name = "PostClickDetector"
-	postClickDetector.MaxActivationDistance = 14
-	postClickDetector.Parent = post
+		local cloned = template:Clone()
+		cloned.Name = "TrainingUpgradeSign"
+		cloned:SetAttribute("OwnerUserId", penInfo.Owner and penInfo.Owner.UserId or 0)
+		cloned:SetAttribute("OwnerName", penInfo.Owner and penInfo.Owner.Name or "")
+		cloned:SetAttribute("DumbbellTier", tier)
 
-	local dumbbellPrompt = Instance.new("ProximityPrompt")
-	dumbbellPrompt.Name = "DumbbellUpgradePrompt"
-	dumbbellPrompt.ObjectText = "Dumbbell"
-	dumbbellPrompt.ActionText = "Upgrade to Medium ($5,000)"
-	dumbbellPrompt.HoldDuration = 0
-	dumbbellPrompt.MaxActivationDistance = 12
-	dumbbellPrompt.RequiresLineOfSight = false
-	dumbbellPrompt.Parent = board
+		local boardPart: BasePart? = nil
+		local postPart: BasePart? = nil
+		for _, child in ipairs(cloned:GetChildren()) do
+			if child:IsA("BasePart") then
+				if child:FindFirstChildWhichIsA("SurfaceGui") then
+					boardPart = child
+				else
+					postPart = child
+				end
+			end
+		end
+		if not boardPart then
+			boardPart = cloned:FindFirstChildWhichIsA("BasePart")
+		end
 
-	local function createSignGui(face: Enum.NormalId)
-		local sg = Instance.new("SurfaceGui")
-		sg.Name = "UpgradeSurfaceGui_" .. face.Name
-		sg.Face = face
-		sg.LightInfluence = 0
-		sg.AlwaysOnTop = false
-		sg.PixelsPerStud = 30
-		sg.Enabled = true
-		sg.Parent = board
+		for _, p in ipairs(cloned:GetDescendants()) do
+			if p:IsA("BasePart") then
+				p.Anchored = true
+				p.CanCollide = true
+				p.CastShadow = true
+				p.Transparency = 0
+				p:SetAttribute("OwnerUserId", penInfo.Owner and penInfo.Owner.UserId or 0)
+			end
+		end
 
-		local frame = Instance.new("Frame")
-		frame.Size = UDim2.fromScale(1, 1)
-		frame.BackgroundColor3 = Color3.fromRGB(20, 24, 32)
-		frame.BorderSizePixel = 0
-		frame.Parent = sg
+		cloned.PrimaryPart = boardPart or postPart or cloned:FindFirstChildWhichIsA("BasePart")
+		local _, bSize = cloned:GetBoundingBox()
+		local targetY = groundY + (bSize.Y / 2)
+		local targetPos = Vector3.new(signBasePos.X, targetY, signBasePos.Z)
 
-		local stroke = Instance.new("UIStroke")
-		stroke.Color = Color3.fromRGB(255, 195, 0)
-		stroke.Thickness = 3
-		stroke.Parent = frame
+		local lookCF = CFrame.lookAt(targetPos, Vector3.new(targetCenter.X, targetY, targetCenter.Z))
+		local rotCF = lookCF
+		if boardPart then
+			ensureMultiSidedGui(boardPart)
+		end
 
-		local title = Instance.new("TextLabel")
-		title.Name = "Title"
-		title.Size = UDim2.new(1, 0, 0.24, 0)
-		title.Position = UDim2.new(0, 0, 0.04, 0)
-		title.BackgroundTransparency = 1
-		title.Font = Enum.Font.FredokaOne
-		title.TextSize = 20
-		title.TextColor3 = Color3.fromRGB(255, 200, 50)
-		title.Text = "🏋️ DUMBBELL UPGRADE"
-		title.Parent = frame
+		cloned:PivotTo(rotCF)
+		cloned.Parent = trainingFolder
+		currentSignModel = cloned
+		penInfo.UpgradeSign = cloned
 
-		local currentLabel = Instance.new("TextLabel")
-		currentLabel.Name = "CurrentLabel"
-		currentLabel.Size = UDim2.new(1, 0, 0.20, 0)
-		currentLabel.Position = UDim2.new(0, 0, 0.28, 0)
-		currentLabel.BackgroundTransparency = 1
-		currentLabel.Font = Enum.Font.FredokaOne
-		currentLabel.TextSize = 16
-		currentLabel.TextColor3 = Color3.fromRGB(220, 220, 220)
-		currentLabel.Text = "Current: Light (+1 Str/tick)"
-		currentLabel.Parent = frame
+		for idx, p in ipairs(cloned:GetDescendants()) do
+			if p:IsA("BasePart") then
+				local cd = Instance.new("ClickDetector")
+				cd.Name = "DumbbellSignClickDetector_" .. idx
+				cd.MaxActivationDistance = 14
+				cd.Parent = p
+				cd.MouseClick:Connect(function(player: Player)
+					performDumbbellUpgrade(player)
+				end)
+			end
+		end
 
-		-- Prominent interactive button on the sign board (no floating prompt!)
-		local upgradeBtn = Instance.new("TextButton")
-		upgradeBtn.Name = "UpgradeButton"
-		upgradeBtn.Size = UDim2.new(0.90, 0, 0.38, 0)
-		upgradeBtn.Position = UDim2.new(0.05, 0, 0.50, 0)
-		upgradeBtn.BackgroundColor3 = Color3.fromRGB(46, 204, 113)
-		upgradeBtn.AutoButtonColor = true
-		upgradeBtn.Font = Enum.Font.FredokaOne
-		upgradeBtn.TextSize = 18
-		upgradeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-		upgradeBtn.Text = "UPGRADE ($5,000)"
-		upgradeBtn.Active = true
-		upgradeBtn.Parent = frame
-
-		local btnCorner = Instance.new("UICorner")
-		btnCorner.CornerRadius = UDim.new(0.25, 0)
-		btnCorner.Parent = upgradeBtn
-
-		local btnStroke = Instance.new("UIStroke")
-		btnStroke.Color = Color3.fromRGB(0, 0, 0)
-		btnStroke.Thickness = 2.5
-		btnStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-		btnStroke.Parent = upgradeBtn
-
-		local hintLabel = Instance.new("TextLabel")
-		hintLabel.Name = "HintLabel"
-		hintLabel.Size = UDim2.new(1, 0, 0.12, 0)
-		hintLabel.Position = UDim2.new(0, 0, 0.88, 0)
-		hintLabel.BackgroundTransparency = 1
-		hintLabel.Font = Enum.Font.FredokaOne
-		hintLabel.TextSize = 11
-		hintLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
-		hintLabel.Text = "[Click button on sign to upgrade]"
-		hintLabel.Parent = frame
-
-		return currentLabel, upgradeBtn
+		-- Remove any ProximityPrompts so no floating text appears; interaction is strictly via the 3D button on dumbel up1 and click detector
+		for _, desc in ipairs(cloned:GetDescendants()) do
+			if desc:IsA("ProximityPrompt") then
+				desc:Destroy()
+			end
+		end
 	end
-
-	local curL1, btnL1 = createSignGui(Enum.NormalId.Front)
-	local curL2, btnL2 = createSignGui(Enum.NormalId.Back)
 
 	local function updateSignDisplay()
 		local tier = penInfo.DumbbellTier or 1
-		local curText = ""
-		local btnText = ""
-		local btnColor = Color3.fromRGB(46, 204, 113)
-
-		if tier == 1 then
-			curText = "Current: Light (+1 Str/tick)"
-			btnText = "UPGRADE TO MEDIUM ($5,000)"
-			btnColor = Color3.fromRGB(46, 204, 113)
-			dumbbellPrompt.ActionText = "Upgrade to Medium ($5,000)"
-			dumbbellPrompt.Enabled = true
-		elseif tier == 2 then
-			curText = "Current: Medium (+5 Str/tick)"
-			btnText = "UPGRADE TO HEAVY ($25,000)"
-			btnColor = Color3.fromRGB(46, 204, 113)
-			dumbbellPrompt.ActionText = "Upgrade to Heavy ($25,000)"
-			dumbbellPrompt.Enabled = true
-		else
-			curText = "Current: Heavy (+20 Str/tick)"
-			btnText = "⭐ MAX LEVEL REACHED ⭐"
-			btnColor = Color3.fromRGB(100, 110, 125)
-			dumbbellPrompt.ActionText = "⭐ Max Level Reached ⭐"
-			dumbbellPrompt.Enabled = false
-		end
-
-		curL1.Text = curText
-		curL2.Text = curText
-		btnL1.Text = btnText
-		btnL2.Text = btnText
-		btnL1.BackgroundColor3 = btnColor
-		btnL2.BackgroundColor3 = btnColor
+		setupDumbbellUpgradeSign(tier)
 	end
 
 	penInfo.UpdateSignDisplay = updateSignDisplay
 	updateSignDisplay()
 
-	local function performDumbbellUpgrade(player: Player)
+	performDumbbellUpgrade = function(player: Player)
+		local signPos = currentSignModel and currentSignModel:GetPivot().Position or (signBasePos + Vector3.new(0, 3, 0))
 		if penInfo.Owner ~= player then
-			showFloatingFeedback(board.Position, "This is not your pen!", Color3.fromRGB(255, 75, 75))
+			showFloatingFeedback(signPos, "This is not your pen!", Color3.fromRGB(255, 75, 75))
 			return
 		end
 
@@ -869,7 +889,7 @@ local function setupPenTrainingArea(penInfo: PenInfo)
 		local hum = char and char:FindFirstChildOfClass("Humanoid")
 		if not root or not hum or hum.Health <= 0 then return end
 
-		local dist = (root.Position - board.Position).Magnitude
+		local dist = (root.Position - signPos).Magnitude
 		if dist > 25 then
 			showFloatingFeedback(root.Position + Vector3.new(0, 2, 0), "Too far from upgrade sign!", Color3.fromRGB(255, 100, 100))
 			return
@@ -884,7 +904,7 @@ local function setupPenTrainingArea(penInfo: PenInfo)
 
 		local tier = penInfo.DumbbellTier or 1
 		if tier >= 3 then
-			showFloatingFeedback(board.Position + Vector3.new(0, 1.5, 0), "⭐ Dumbbell already at Max Level!", Color3.fromRGB(255, 200, 80))
+			showFloatingFeedback(signPos + Vector3.new(0, 1.5, 0), "⭐ Dumbbell already at Max Level!", Color3.fromRGB(255, 200, 80))
 			return
 		end
 
@@ -904,7 +924,7 @@ local function setupPenTrainingArea(penInfo: PenInfo)
 		end
 
 		if currentStrength < reqStrength then
-			showFloatingFeedback(board.Position + Vector3.new(0, 1.5, 0),
+			showFloatingFeedback(signPos + Vector3.new(0, 1.5, 0),
 				string.format("❌ Need %d Strength to upgrade! (Have: %d)", reqStrength, currentStrength),
 				Color3.fromRGB(255, 75, 75))
 			return
@@ -920,7 +940,7 @@ local function setupPenTrainingArea(penInfo: PenInfo)
 		end
 
 		if currentMoney < cost then
-			showFloatingFeedback(board.Position + Vector3.new(0, 1.5, 0),
+			showFloatingFeedback(signPos + Vector3.new(0, 1.5, 0),
 				string.format("❌ Need $%d to upgrade! (Have: $%d)", cost, currentMoney),
 				Color3.fromRGB(255, 75, 75))
 			return
@@ -964,17 +984,12 @@ local function setupPenTrainingArea(penInfo: PenInfo)
 
 		updateSignDisplay()
 
-		showFloatingFeedback(board.Position + Vector3.new(0, 2, 0),
+		showFloatingFeedback(signPos + Vector3.new(0, 2, 0),
 			string.format("🎉 Upgraded to %s! (+%d Strength/tick)", nextName, nextGain),
 			Color3.fromRGB(80, 255, 120))
 	end
 
 	penInfo.PerformUpgrade = performDumbbellUpgrade
-	clickDetector.MouseClick:Connect(performDumbbellUpgrade)
-	postClickDetector.MouseClick:Connect(performDumbbellUpgrade)
-	dumbbellPrompt.Triggered:Connect(function(player: Player)
-		performDumbbellUpgrade(player)
-	end)
 
 	-- Auto-detect player stepping on training pad
 	pad.Touched:Connect(function(hit)
@@ -986,25 +1001,14 @@ local function setupPenTrainingArea(penInfo: PenInfo)
 		end
 	end)
 
-	-- Also setup ProximityPrompt on EggArea to place eggs from inventory
+	-- Remove any floating button or ClickDetector on EggArea: egg placement is handled by tapping anywhere in pen
 	local existingPlacePrompt = eggArea:FindFirstChild("PlaceEggPrompt")
-	if not existingPlacePrompt then
-		local prompt = Instance.new("ProximityPrompt")
-		prompt.Name = "PlaceEggPrompt"
-		prompt.ObjectText = "Pen Platform"
-		prompt.ActionText = "Place Egg from Inventory"
-		prompt.HoldDuration = 0
-		prompt.MaxActivationDistance = 14
-		prompt.RequiresLineOfSight = false
-		prompt.Parent = eggArea
-
-		prompt.Triggered:Connect(function(player: Player)
-			if penInfo.Owner == player then
-				placeEggFromInventory(player, penInfo)
-			else
-				showFloatingFeedback(eggArea.Position, "This is not your pen!", Color3.fromRGB(255, 75, 75))
-			end
-		end)
+	if existingPlacePrompt then
+		existingPlacePrompt:Destroy()
+	end
+	local existingPlatformClick = eggArea:FindFirstChild("PlatformClickDetector")
+	if existingPlatformClick then
+		existingPlatformClick:Destroy()
 	end
 end
 
@@ -1045,43 +1049,213 @@ task.spawn(function()
 	end
 end)
 
--- Physical invisible barrier walls around EggArea to prevent characters from escaping pen
+-- Clean up any legacy containment barriers so players can walk freely into their pen without hitting invisible walls
 local function setupPenContainmentBarriers(penInfo: PenInfo)
-	local eggArea = penInfo.EggArea
-	if not eggArea then return end
-
 	local existing = penInfo.Model:FindFirstChild("PenContainmentWalls")
-	if existing then existing:Destroy() end
+	if existing then
+		existing:Destroy()
+	end
+end
 
-	local folder = Instance.new("Model")
-	folder.Name = "PenContainmentWalls"
+-- Visual Pen Upgrade System: uses existing read-only templates Workspace["pen l1"] .. Workspace["pen l5"]
+local function getPenTemplate(level: number): Model?
+	local targetName = "pen l" .. level
+	local direct = Workspace:FindFirstChild(targetName)
+	if direct and direct:IsA("Model") then return direct end
+	for _, child in ipairs(Workspace:GetChildren()) do
+		if child:IsA("Model") and child.Name:lower() == targetName then
+			return child
+		end
+	end
+	return nil
+end
 
-	local sizeX = eggArea.Size.X
-	local sizeZ = eggArea.Size.Z
-	local wallHeight = 18
-	local wallThickness = 1.0
+-- Calculate axis-aligned bounding box from a list of instances/models using BasePart positions
+local function getBoundingBoxOfInstances(instances: { Instance }): (Vector3, Vector3)
+	local minX, minY, minZ = math.huge, math.huge, math.huge
+	local maxX, maxY, maxZ = -math.huge, -math.huge, -math.huge
+	for _, inst in ipairs(instances) do
+		for _, desc in ipairs(inst:GetDescendants()) do
+			if desc:IsA("BasePart") then
+				local p = desc.Position
+				minX = math.min(minX, p.X)
+				maxX = math.max(maxX, p.X)
+				minY = math.min(minY, p.Y)
+				maxY = math.max(maxY, p.Y)
+				minZ = math.min(minZ, p.Z)
+				maxZ = math.max(maxZ, p.Z)
+			end
+		end
+		if inst:IsA("BasePart") then
+			local p = inst.Position
+			minX = math.min(minX, p.X)
+			maxX = math.max(maxX, p.X)
+			minY = math.min(minY, p.Y)
+			maxY = math.max(maxY, p.Y)
+			minZ = math.min(minZ, p.Z)
+			maxZ = math.max(maxZ, p.Z)
+		end
+	end
+	return Vector3.new(minX, minY, minZ), Vector3.new(maxX, maxY, maxZ)
+end
 
-	local wallConfigs = {
-		{ Offset = Vector3.new(0, wallHeight / 2, sizeZ / 2 + wallThickness / 2), Size = Vector3.new(sizeX + wallThickness * 2, wallHeight, wallThickness) },
-		{ Offset = Vector3.new(0, wallHeight / 2, -sizeZ / 2 - wallThickness / 2), Size = Vector3.new(sizeX + wallThickness * 2, wallHeight, wallThickness) },
-		{ Offset = Vector3.new(sizeX / 2 + wallThickness / 2, wallHeight / 2, 0), Size = Vector3.new(wallThickness, wallHeight, sizeZ) },
-		{ Offset = Vector3.new(-sizeX / 2 - wallThickness / 2, wallHeight / 2, 0), Size = Vector3.new(wallThickness, wallHeight, sizeZ) },
-	}
+-- Get the entrance center of a template (Workspace["pen l1"] .. Workspace["pen l5"])
+-- All templates face +X, so their entrance is located at maxX
+local function getTemplateEntranceCenter(template: Model): Vector3
+	local fencePieces: { Instance } = {}
+	for _, child in ipairs(template:GetChildren()) do
+		local nameL = child.Name:lower()
+		if child:IsA("Model") and (nameL == "pen" or nameL == "corner") then
+			table.insert(fencePieces, child)
+		end
+	end
+	if #fencePieces == 0 then
+		for _, child in ipairs(template:GetChildren()) do
+			if child:IsA("Model") and not child.Name:lower():find("sign") then
+				table.insert(fencePieces, child)
+			end
+		end
+	end
+	local tMin, tMax = getBoundingBoxOfInstances(fencePieces)
+	return Vector3.new(tMax.X, (tMin.Y + tMax.Y) / 2, (tMin.Z + tMax.Z) / 2)
+end
 
-	for i, cfg in ipairs(wallConfigs) do
-		local wall = Instance.new("Part")
-		wall.Name = "BarrierWall_" .. i
-		wall.Size = cfg.Size
-		wall.CFrame = eggArea.CFrame * CFrame.new(cfg.Offset)
-		wall.Transparency = 1
-		wall.CanCollide = true
-		wall.Anchored = true
-		wall.CanTouch = false
-		wall.CanQuery = false
-		wall.Parent = folder
+-- Compute entrance center for a pen based on its fence bounding box and forward direction
+local function getPenEntranceCenter(penInfo: PenInfo): Vector3
+	local sourceFolder = (penInfo.DefaultFences and #penInfo.DefaultFences:GetChildren() > 0)
+		and penInfo.DefaultFences
+		or penInfo.FenceVisuals
+
+	local instances: { Instance } = (sourceFolder and sourceFolder:GetChildren()) or {}
+	if #instances == 0 and penInfo.Model then
+		for _, child in ipairs(penInfo.Model:GetChildren()) do
+			local nameL = child.Name:lower()
+			if child:IsA("Model") and (nameL == "pen" or nameL == "corner") then
+				table.insert(instances, child)
+			end
+		end
 	end
 
-	folder.Parent = penInfo.Model
+	local pMin, pMax = getBoundingBoxOfInstances(instances)
+	local fwd = penInfo.ForwardDir
+	if fwd.X > 0.5 then
+		return Vector3.new(pMax.X, (pMin.Y + pMax.Y) / 2, (pMin.Z + pMax.Z) / 2)
+	elseif fwd.X < -0.5 then
+		return Vector3.new(pMin.X, (pMin.Y + pMax.Y) / 2, (pMin.Z + pMax.Z) / 2)
+	elseif fwd.Z > 0.5 then
+		return Vector3.new((pMin.X + pMax.X) / 2, (pMin.Y + pMax.Y) / 2, pMax.Z)
+	else
+		return Vector3.new((pMin.X + pMax.X) / 2, (pMin.Y + pMax.Y) / 2, pMin.Z)
+	end
+end
+
+-- Get rotation CFrame mapping template forward (+X) to pen forward direction
+local function getRotationForForward(fwd: Vector3): CFrame
+	if fwd.Z > 0.5 then
+		-- +X to +Z: 90 deg clockwise around Y (yaw = -pi/2)
+		return CFrame.Angles(0, -math.pi / 2, 0)
+	elseif fwd.Z < -0.5 then
+		-- +X to -Z: 90 deg counter-clockwise around Y (yaw = pi/2)
+		return CFrame.Angles(0, math.pi / 2, 0)
+	elseif fwd.X < -0.5 then
+		-- +X to -X: 180 deg around Y (yaw = pi)
+		return CFrame.Angles(0, math.pi, 0)
+	else
+		-- +X to +X: Identity
+		return CFrame.new()
+	end
+end
+
+applyPenVisualLevel = function(penInfo: PenInfo, targetLevel: number)
+	targetLevel = math.floor(tonumber(targetLevel) or 0)
+
+	local fenceFolder = penInfo.FenceVisuals
+	if not fenceFolder or fenceFolder.Parent ~= penInfo.Model then
+		fenceFolder = penInfo.Model:FindFirstChild("FenceVisuals") :: Folder?
+		if not fenceFolder then
+			fenceFolder = Instance.new("Folder")
+			fenceFolder.Name = "FenceVisuals"
+			fenceFolder.Parent = penInfo.Model
+		end
+		penInfo.FenceVisuals = fenceFolder
+	end
+
+	-- Level 0 restores the original base pen fence design
+	if targetLevel <= 0 then
+		if penInfo.VisualLevel == 0 and #fenceFolder:GetChildren() > 0 then
+			return
+		end
+		fenceFolder:ClearAllChildren()
+		if penInfo.DefaultFences and #penInfo.DefaultFences:GetChildren() > 0 then
+			for _, child in ipairs(penInfo.DefaultFences:GetChildren()) do
+				local clone = child:Clone()
+				for _, desc in ipairs(clone:GetDescendants()) do
+					if desc:IsA("BasePart") then
+						desc.Anchored = true
+						desc.CanCollide = true
+					end
+				end
+				clone.Parent = fenceFolder
+			end
+		end
+		penInfo.VisualLevel = 0
+		penInfo.Model:SetAttribute("VisualPenLevel", 0)
+		return
+	end
+
+	targetLevel = math.clamp(targetLevel, 1, 5)
+
+	-- If already displaying this level with valid children, avoid redundant rebuilding
+	if penInfo.VisualLevel == targetLevel and #fenceFolder:GetChildren() > 0 then
+		return
+	end
+
+	local template = getPenTemplate(targetLevel)
+	if not template then
+		warn(string.format("[GameplayManager] Could not find visual template 'pen l%d' in Workspace!", targetLevel))
+		return
+	end
+
+	local templateEntrance = getTemplateEntranceCenter(template)
+	local penEntrance = penInfo.EntranceCenter
+	if not penEntrance then
+		penEntrance = getPenEntranceCenter(penInfo)
+		penInfo.EntranceCenter = penEntrance
+	end
+
+	local rot = getRotationForForward(penInfo.ForwardDir)
+	local deltaCF = CFrame.new(penEntrance) * rot * CFrame.new(-templateEntrance)
+
+	-- Clear old fences safely; functional parts (EggArea, Sign, TrainingArea, eggs, pets) are untouched
+	fenceFolder:ClearAllChildren()
+
+	-- Clone only the visual fence pieces from the template (models named "pen" or "corner")
+	for _, child in ipairs(template:GetChildren()) do
+		local nameL = child.Name:lower()
+		if child:IsA("Model") and (nameL == "pen" or nameL == "corner") then
+			local clone = child:Clone()
+			-- Directly transform each BasePart's CFrame to guarantee perfect alignment
+			-- and avoid any PrimaryPart or Model pivot inconsistencies
+			for _, desc in ipairs(clone:GetDescendants()) do
+				if desc:IsA("BasePart") then
+					desc.CFrame = deltaCF * desc.CFrame
+					desc.Anchored = true
+					desc.CanCollide = true
+				end
+			end
+			clone.Parent = fenceFolder
+		elseif child:IsA("BasePart") and nameL ~= "sign" and not nameL:find("egg") then
+			local clone = child:Clone()
+			clone.CFrame = deltaCF * clone.CFrame
+			clone.Anchored = true
+			clone.CanCollide = true
+			clone.Parent = fenceFolder
+		end
+	end
+
+	penInfo.VisualLevel = targetLevel
+	penInfo.Model:SetAttribute("VisualPenLevel", targetLevel)
+	print(string.format("[GameplayManager] Applied visual fence Level %d to Pen %d", targetLevel, penInfo.Index))
 end
 
 -- Add a clickable pen-upgrade GUI to the existing sign beside each pen.
@@ -1135,140 +1309,114 @@ local function setupPenUpgradeGui(penInfo: PenInfo)
 		end
 	end
 
-	local levelLabels: { TextLabel } = {}
-	local actionLabels: { TextLabel } = {}
+	local currentPenSignModel: Model? = nil
+	local penPrompt: ProximityPrompt? = nil
+	local performPenUpgrade: (Player) -> () -- forward declaration
 
-	local function createGuiOnFace(face: Enum.NormalId, suffix: string)
-		local gui = Instance.new("SurfaceGui")
-		gui.Name = "PenUpgradeGui_" .. suffix
-		gui.Face = face
-		gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
-		gui.PixelsPerStud = 32
-		gui.LightInfluence = 0
-		gui.AlwaysOnTop = true
-		gui.Parent = signPart
+	local function setupOrUpdatePenSign(level: number)
+		if currentPenSignModel and currentPenSignModel.Parent then
+			currentPenSignModel:Destroy()
+			currentPenSignModel = nil
+		end
 
-		local frame = Instance.new("Frame")
-		frame.Name = "Panel"
-		frame.Size = UDim2.fromScale(1, 1)
-		frame.BackgroundColor3 = Color3.fromRGB(25, 29, 40)
-		frame.BorderSizePixel = 0
-		frame.Parent = gui
-		local stroke = Instance.new("UIStroke")
-		stroke.Color = Color3.fromRGB(255, 195, 0)
-		stroke.Thickness = 3
-		stroke.Parent = frame
+		local templateIndex = math.clamp(level <= 1 and 1 or level, 1, 5)
+		local template = getPenUpgradeSignTemplate(templateIndex)
+		if not template then
+			template = getPenUpgradeSignTemplate(1)
+		end
 
-		local title = Instance.new("TextLabel")
-		title.Name = "Title"
-		title.Size = UDim2.new(1, -8, 0.28, 0)
-		title.Position = UDim2.new(0, 4, 0.02, 0)
-		title.BackgroundTransparency = 1
-		title.Font = Enum.Font.FredokaOne
-		title.TextScaled = true
-		title.TextColor3 = Color3.fromRGB(255, 205, 55)
-		title.Text = "PEN UPGRADE"
-		title.Parent = frame
+		if not template then
+			warn("[GameplayManager] No pen upgrade sign template found for level " .. tostring(level))
+			return
+		end
 
-		local levelLabel = Instance.new("TextLabel")
-		levelLabel.Name = "Level"
-		levelLabel.Size = UDim2.new(1, -8, 0.25, 0)
-		levelLabel.Position = UDim2.new(0, 4, 0.30, 0)
-		levelLabel.BackgroundTransparency = 1
-		levelLabel.Font = Enum.Font.FredokaOne
-		levelLabel.TextScaled = true
-		levelLabel.TextColor3 = Color3.new(1, 1, 1)
-		levelLabel.Parent = frame
-		table.insert(levelLabels, levelLabel)
+		local cloned = template:Clone()
+		cloned.Name = "PenUpgradeSign"
+		cloned:SetAttribute("OwnerUserId", penInfo.Owner and penInfo.Owner.UserId or 0)
+		cloned:SetAttribute("OwnerName", penInfo.Owner and penInfo.Owner.Name or "")
+		cloned:SetAttribute("PenUpgradeLevel", level)
 
-		local actionLabel = Instance.new("TextLabel")
-		actionLabel.Name = "Action"
-		actionLabel.Size = UDim2.new(1, -8, 0.34, 0)
-		actionLabel.Position = UDim2.new(0, 4, 0.57, 0)
-		actionLabel.BackgroundColor3 = Color3.fromRGB(46, 180, 92)
-		actionLabel.Font = Enum.Font.FredokaOne
-		actionLabel.TextScaled = true
-		actionLabel.TextColor3 = Color3.new(1, 1, 1)
-		actionLabel.Parent = frame
-		local actionCorner = Instance.new("UICorner")
-		actionCorner.CornerRadius = UDim.new(0, 6)
-		actionCorner.Parent = actionLabel
-		table.insert(actionLabels, actionLabel)
+		local boardPart: BasePart? = nil
+		local postPart: BasePart? = nil
+		for _, child in ipairs(cloned:GetChildren()) do
+			if child:IsA("BasePart") then
+				if child:FindFirstChildWhichIsA("SurfaceGui") then
+					boardPart = child
+				else
+					postPart = child
+				end
+			end
+		end
+		if not boardPart then
+			boardPart = cloned:FindFirstChildWhichIsA("BasePart")
+		end
 
-		local hint = Instance.new("TextLabel")
-		hint.Name = "Hint"
-		hint.Size = UDim2.new(1, -8, 0.10, 0)
-		hint.Position = UDim2.new(0, 4, 0.90, 0)
-		hint.BackgroundTransparency = 1
-		hint.Font = Enum.Font.GothamBold
-		hint.TextScaled = true
-		hint.TextColor3 = Color3.fromRGB(210, 210, 210)
-		hint.Text = "CLICK SIGN TO UPGRADE"
-		hint.Parent = frame
+		for _, p in ipairs(cloned:GetDescendants()) do
+			if p:IsA("BasePart") then
+				p.Anchored = true
+				p.CanCollide = true
+				p.CastShadow = true
+				p.Transparency = 0
+				p:SetAttribute("OwnerUserId", penInfo.Owner and penInfo.Owner.UserId or 0)
+			end
+		end
+
+		cloned.PrimaryPart = boardPart or postPart or cloned:FindFirstChildWhichIsA("BasePart")
+		cloned:PivotTo(signPart.CFrame)
+
+		if boardPart then
+			ensureMultiSidedGui(boardPart)
+		end
+
+		cloned.Parent = penInfo.Model
+		currentPenSignModel = cloned
+		penInfo.PenSign = cloned
+
+		for _, p in ipairs(signParts) do
+			p.Transparency = 1
+			p.CanCollide = false
+		end
+
+		for idx, p in ipairs(cloned:GetDescendants()) do
+			if p:IsA("BasePart") then
+				local cd = Instance.new("ClickDetector")
+				cd.Name = "PenSignClickDetector_" .. idx
+				cd.MaxActivationDistance = 16
+				cd.Parent = p
+				cd.MouseClick:Connect(function(player: Player)
+					performPenUpgrade(player)
+				end)
+			end
+		end
+
+		-- Remove any ProximityPrompts so no floating text appears; interaction is strictly via the 3D button on pen up1 and click detector
+		for _, desc in ipairs(cloned:GetDescendants()) do
+			if desc:IsA("ProximityPrompt") then
+				desc:Destroy()
+			end
+		end
 	end
-
-	createGuiOnFace(Enum.NormalId.Front, "Front")
-	createGuiOnFace(Enum.NormalId.Back, "Back")
-	createGuiOnFace(Enum.NormalId.Left, "Left")
-	createGuiOnFace(Enum.NormalId.Right, "Right")
-
-	local penPrompt = Instance.new("ProximityPrompt")
-	penPrompt.Name = "PenUpgradePrompt"
-	penPrompt.ObjectText = "Pen"
-	penPrompt.ActionText = "Upgrade Pen ($5,000)"
-	penPrompt.HoldDuration = 0
-	penPrompt.MaxActivationDistance = 14
-	penPrompt.RequiresLineOfSight = false
-	penPrompt.Parent = signPart
 
 	local function refresh()
 		local level = (_G.PlayerData and _G.PlayerData.getPenUpgradeLevel and penInfo.Owner)
 			and _G.PlayerData.getPenUpgradeLevel(penInfo.Owner) or (penInfo.Model:GetAttribute("PenUpgradeLevel") or 0)
 		level = math.clamp(tonumber(level) or 0, 0, 5)
-
-		local levelText: string
-		if penInfo.Owner then
-			levelText = string.format("LEVEL %d  •  PET LIMIT %d", level, 6 + level)
-		else
-			levelText = "UNCLAIMED PEN"
-		end
-
-		local actionText: string
-		local actionColor: Color3
-		if level >= 5 then
-			actionText = "MAX LEVEL"
-			actionColor = Color3.fromRGB(90, 100, 115)
-			penPrompt.ActionText = "⭐ Max Level (11 Pets) ⭐"
-			penPrompt.Enabled = false
-		else
-			local cost = PEN_UPGRADE_COSTS[level + 1]
-			actionText = string.format("UPGRADE  $%d", cost)
-			actionColor = Color3.fromRGB(46, 180, 92)
-			penPrompt.ActionText = string.format("Upgrade Pen ($%d) • Pet Limit %d", cost, 6 + level + 1)
-			penPrompt.Enabled = true
-		end
-
-		for _, lbl in ipairs(levelLabels) do
-			lbl.Text = levelText
-		end
-		for _, act in ipairs(actionLabels) do
-			act.Text = actionText
-			act.BackgroundColor3 = actionColor
-		end
+		setupOrUpdatePenSign(level)
 	end
 
-	local function performPenUpgrade(player: Player)
+	performPenUpgrade = function(player: Player)
+		local signPos = currentPenSignModel and currentPenSignModel:GetPivot().Position or signPart.Position
 		if penInfo.Owner ~= player then
-			showFloatingFeedback(signPart.Position, "This is not your pen!", Color3.fromRGB(255, 75, 75))
+			showFloatingFeedback(signPos, "This is not your pen!", Color3.fromRGB(255, 75, 75))
 			return
 		end
 		local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart") :: BasePart?
-		if not root or (root.Position - signPart.Position).Magnitude > 25 then return end
+		if not root or (root.Position - signPos).Magnitude > 25 then return end
 		local level = (_G.PlayerData and _G.PlayerData.getPenUpgradeLevel and _G.PlayerData.getPenUpgradeLevel(player))
 			or (penInfo.Model:GetAttribute("PenUpgradeLevel") or 0)
 		level = math.clamp(tonumber(level) or 0, 0, 5)
 		if level >= 5 then
-			showFloatingFeedback(signPart.Position, "Pen is already at maximum level!", Color3.fromRGB(255, 205, 55))
+			showFloatingFeedback(signPos, "Pen is already at maximum level!", Color3.fromRGB(255, 205, 55))
 			return
 		end
 		local cost = PEN_UPGRADE_COSTS[level + 1]
@@ -1277,7 +1425,7 @@ local function setupPenUpgradeGui(penInfo: PenInfo)
 			return
 		end
 		if _G.PlayerData.getMoney(player) < cost then
-			showFloatingFeedback(signPart.Position, string.format("Need $%d to upgrade your pen!", cost), Color3.fromRGB(255, 75, 75))
+			showFloatingFeedback(signPos, string.format("Need $%d to upgrade your pen!", cost), Color3.fromRGB(255, 75, 75))
 			return
 		end
 		if not _G.PlayerData.deductMoney(player, cost) then return end
@@ -1288,8 +1436,9 @@ local function setupPenUpgradeGui(penInfo: PenInfo)
 		end
 		penInfo.Model:SetAttribute("PenUpgradeLevel", newLevel)
 		penInfo.Model:SetAttribute("EquippedPetLimit", 6 + newLevel)
+		applyPenVisualLevel(penInfo, newLevel)
 		refresh()
-		showFloatingFeedback(signPart.Position + Vector3.new(0, 2, 0),
+		showFloatingFeedback(signPos + Vector3.new(0, 2, 0),
 			string.format("PEN UPGRADED! Level %d • Pet limit %d", newLevel, 6 + newLevel),
 			Color3.fromRGB(80, 255, 120))
 	end
@@ -1301,10 +1450,6 @@ local function setupPenUpgradeGui(penInfo: PenInfo)
 		click.Parent = p
 		click.MouseClick:Connect(performPenUpgrade)
 	end
-
-	penPrompt.Triggered:Connect(function(player: Player)
-		performPenUpgrade(player)
-	end)
 
 	penInfo.PerformPenUpgrade = performPenUpgrade
 	penInfo.UpdatePenUpgradeDisplay = refresh
@@ -1336,13 +1481,45 @@ local function discoverPens()
 				end
 
 				if eggArea then
+					local fenceFolder = child:FindFirstChild("FenceVisuals") :: Folder?
+					if not fenceFolder then
+						fenceFolder = Instance.new("Folder")
+						fenceFolder.Name = "FenceVisuals"
+						fenceFolder.Parent = child
+
+						for _, item in ipairs(child:GetChildren()) do
+							if item:IsA("Model") and (item.Name:lower() == "pen" or item.Name:lower() == "corner") then
+								item.Parent = fenceFolder
+							end
+						end
+					end
+
+					local defaultFences = Instance.new("Folder")
+					defaultFences.Name = "DefaultFences"
+					for _, item in ipairs(fenceFolder:GetChildren()) do
+						item:Clone().Parent = defaultFences
+					end
+
+					-- Determine true pen forward direction from eggArea to sign
+					local forwardDir = Vector3.new(0, 0, 1)
+					local signPart = (signModel and signModel:FindFirstChildWhichIsA("BasePart", true))
+					if signPart and eggArea then
+						local diff = signPart.Position - eggArea.Position
+						if math.abs(diff.X) > math.abs(diff.Z) then
+							forwardDir = if diff.X > 0 then Vector3.new(1, 0, 0) else Vector3.new(-1, 0, 0)
+						else
+							forwardDir = if diff.Z > 0 then Vector3.new(0, 0, 1) else Vector3.new(0, 0, -1)
+						end
+					end
+
 					local penInfo: PenInfo = {
 						Index = index,
 						Model = child,
 						EggArea = eggArea,
 						Sign = signModel,
 						Owner = nil,
-						ForwardDir = Vector3.new(0, 0, 1),
+						ForwardDir = forwardDir,
+						EntranceCenter = nil,
 						TrainingArea = nil,
 						TrainingPad = nil,
 						TrainingDumbbell = nil,
@@ -1350,7 +1527,12 @@ local function discoverPens()
 						OverheadAvatar = nil,
 						OverheadLabel = nil,
 						Slots = {},
+						FenceVisuals = fenceFolder,
+						VisualLevel = 0,
+						DefaultFences = defaultFences,
 					}
+					penInfo.EntranceCenter = getPenEntranceCenter(penInfo)
+					child:SetAttribute("VisualPenLevel", 0)
 					table.insert(pensList, penInfo)
 				end
 			end
@@ -1372,6 +1554,18 @@ local function discoverPens()
 		setupPenTrainingArea(p)
 		setupPenUpgradeGui(p)
 		setupPenContainmentBarriers(p)
+
+		-- Ensure all existing and future pets inside the pen are strictly non-collidable
+		for _, desc in ipairs(p.Model:GetDescendants()) do
+			if desc:IsA("Model") and (desc:GetAttribute("PetType") or desc:FindFirstChildOfClass("Humanoid") or desc.Name:lower():find("lee")) then
+				configurePetCollisions(desc)
+			end
+		end
+		p.Model.DescendantAdded:Connect(function(desc)
+			if desc:IsA("Model") and (desc:GetAttribute("PetType") or desc:FindFirstChildOfClass("Humanoid") or desc.Name:lower():find("lee")) then
+				configurePetCollisions(desc)
+			end
+		end)
 	end
 end
 
@@ -1443,12 +1637,40 @@ local function assignPenToPlayer(player: Player): PenInfo?
 			pen.Owner = player
 			playerPenMap[player] = pen
 			updatePenOwnerDisplay(pen, player)
+
+			local savedLevel = 0
+			if _G.PlayerData and _G.PlayerData.getPenUpgradeLevel then
+				savedLevel = _G.PlayerData.getPenUpgradeLevel(player)
+			else
+				local attr = player:GetAttribute("PenUpgradeLevel")
+				if typeof(attr) == "number" then
+					savedLevel = attr
+				end
+			end
+			savedLevel = math.clamp(tonumber(savedLevel) or 0, 0, 5)
+			pen.Model:SetAttribute("PenUpgradeLevel", savedLevel)
+			pen.Model:SetAttribute("EquippedPetLimit", 6 + savedLevel)
+			applyPenVisualLevel(pen, savedLevel)
+			if pen.UpdatePenUpgradeDisplay then
+				pen.UpdatePenUpgradeDisplay()
+			end
+
 			player:GetAttributeChangedSignal("PenUpgradeLevel"):Connect(function()
 				if pen.Owner == player then
 					updatePenOwnerDisplay(pen, player)
+					local lvl = player:GetAttribute("PenUpgradeLevel")
+					if typeof(lvl) == "number" then
+						lvl = math.clamp(math.floor(lvl), 0, 5)
+						pen.Model:SetAttribute("PenUpgradeLevel", lvl)
+						pen.Model:SetAttribute("EquippedPetLimit", 6 + lvl)
+						applyPenVisualLevel(pen, lvl)
+						if pen.UpdatePenUpgradeDisplay then
+							pen.UpdatePenUpgradeDisplay()
+						end
+					end
 				end
 			end)
-			print(string.format("[GameplayManager] Assigned Pen %d to player %s", pen.Index, player.Name))
+			print(string.format("[GameplayManager] Assigned Pen %d to player %s (PenUpgradeLevel: %d)", pen.Index, player.Name, savedLevel))
 			return pen
 		end
 	end
@@ -1478,6 +1700,7 @@ local playerCarriedEgg: { [Player]: CarriedEggInfo } = {}
 local placeEggInPen: (Player, PenInfo, any?, CFrame?) -> boolean
 local spawnZone1Eggs: () -> ()
 local pickUpEgg: (Player, Model) -> ()
+local findEggSpawnParts: () -> { BasePart }
 
 local worldEggsFolder: Folder
 local function getOrCreateWorldEggsFolder(): Folder
@@ -1716,42 +1939,8 @@ local function giveEggTool(player: Player, eggData: { SizeTier: string, Scale: n
 		handle.Color = Color3.fromRGB(250, 245, 235)
 	end
 
-	-- Place egg when clicking with tool equipped near pen platform
-	tool.Activated:Connect(function()
-		local pen = playerPenMap[player]
-		if not pen then
-			showFloatingFeedback(player.Character and player.Character:GetPivot().Position or Vector3.zero,
-				"You don't own a pen yet!", Color3.fromRGB(255, 80, 80))
-			return
-		end
-
-		local char = player.Character
-		local root = char and char:FindFirstChild("HumanoidRootPart") :: BasePart?
-		if not root then return end
-
-		local dist = (root.Position - pen.EggArea.Position).Magnitude
-		local maxDist = math.max(25, pen.EggArea.Size.Magnitude / 2 + 10)
-		if dist > maxDist then
-			showFloatingFeedback(root.Position + Vector3.new(0, 2.5, 0),
-				"Go to your pen platform to place this egg!", Color3.fromRGB(255, 200, 80))
-			return
-		end
-
-		local currentCount = getPlacedItemCount(pen)
-		if currentCount >= GameplayConfig.Eggs.MaxPlacedCapacity then
-			showFloatingFeedback(root.Position + Vector3.new(0, 2.5, 0),
-				"❌ Pen Full! (30/30 Eggs placed)", Color3.fromRGB(255, 75, 75))
-			return
-		end
-
-		local placed = placeEggInPen(player, pen, eggData)
-		if placed then
-			tool:Destroy()
-			if _G.PlayerData and _G.PlayerData.removeEggFromInventory then
-				_G.PlayerData.removeEggFromInventory(player, eggData)
-			end
-		end
-	end)
+	-- Note: Egg placement is handled client-side via PlaceEggAtLocation RemoteEvent
+	-- ensuring eggs appear exactly at the tapped/clicked position on the player's pen platform.
 
 	tool.Parent = player.Backpack
 end
@@ -2054,8 +2243,14 @@ local function releasePlayerPen(player: Player)
 		clearPenContents(pen)
 		pen.DumbbellTier = 1
 		pen.Model:SetAttribute("DumbbellTier", 1)
+		pen.Model:SetAttribute("PenUpgradeLevel", 0)
+		pen.Model:SetAttribute("EquippedPetLimit", 6)
+		applyPenVisualLevel(pen, 0)
 		if pen.UpdateSignDisplay then
 			pen.UpdateSignDisplay()
+		end
+		if pen.UpdatePenUpgradeDisplay then
+			pen.UpdatePenUpgradeDisplay()
 		end
 		local dumbel1Prototype = getDumbbellPrototype("dumbel1")
 		if dumbel1Prototype and pen.TrainingArea and pen.TrainingDumbbell and pen.TrainingPad then
@@ -2087,19 +2282,50 @@ end
 --------------------------------------------------------------------------------
 local leePrototype = Workspace:WaitForChild("characters"):WaitForChild("lee") :: Model
 
-local function configurePetCollisions(pet: Model)
-	for _, desc in ipairs(pet:GetDescendants()) do
-		if desc:IsA("BasePart") then
-			desc.CanCollide = false
-			desc.CanTouch = false
-			desc.CanQuery = false
-			desc.Anchored = false
-			pcall(function()
-				desc.CollisionGroup = CHAR_COLLISION_GROUP
-			end)
-		end
+local function applySinglePetPartSettings(part: BasePart)
+	part.CanCollide = false
+	part.CanTouch = false
+	part.CanQuery = false
+	pcall(function()
+		part.CollisionGroup = PET_COLLISION_GROUP
+	end)
+
+	if not part:GetAttribute("PetCollisionHooked") then
+		part:SetAttribute("PetCollisionHooked", true)
+		part:GetPropertyChangedSignal("CanCollide"):Connect(function()
+			if part.CanCollide then
+				part.CanCollide = false
+			end
+		end)
+		part:GetPropertyChangedSignal("CanTouch"):Connect(function()
+			if part.CanTouch then
+				part.CanTouch = false
+			end
+		end)
+		part:GetPropertyChangedSignal("CanQuery"):Connect(function()
+			if part.CanQuery then
+				part.CanQuery = false
+			end
+		end)
 	end
 end
+
+configurePetCollisions = function(pet: Model)
+	for _, desc in ipairs(pet:GetDescendants()) do
+		if desc:IsA("BasePart") then
+			applySinglePetPartSettings(desc)
+		end
+	end
+
+	pet.DescendantAdded:Connect(function(desc)
+		if desc:IsA("BasePart") then
+			applySinglePetPartSettings(desc)
+		end
+	end)
+end
+
+-- Configure the character prototype as well
+configurePetCollisions(leePrototype)
 
 -- Strictly keep Rock Lee inside the pen's egg area bounds using object-space calculations
 local function startLeeWanderingAI(lee: Model, penInfo: PenInfo)
@@ -2194,10 +2420,13 @@ local function hatchSlot(penInfo: PenInfo, slotIndex: number)
 		return
 	end
 
-	local slotCFrame = calculateSlotCFrame(penInfo.EggArea, slotIndex)
 	local eggModel = slot.Model
+	local eggPivot = eggModel and eggModel:GetPivot()
+	local eggPos = eggPivot and eggPivot.Position or calculateSlotCFrame(penInfo.EggArea, slotIndex).Position
 
-	eggModel:Destroy()
+	if eggModel then
+		eggModel:Destroy()
+	end
 
 	local newLee = leePrototype:Clone()
 	newLee.Name = string.format("Lee_%s_%d", owner.Name, slotIndex)
@@ -2213,18 +2442,75 @@ local function hatchSlot(penInfo: PenInfo, slotIndex: number)
 		anim.Parent = hum
 	end
 
-	newLee:PivotTo(slotCFrame + Vector3.new(0, 1.5, 0))
+	local spawnY = penInfo.EggArea.Position.Y + (penInfo.EggArea.Size.Y / 2) + 1.5
+	newLee:PivotTo(CFrame.new(eggPos.X, spawnY, eggPos.Z))
 	newLee.Parent = penInfo.Model
 
 	slot.Type = "Pet"
 	slot.Model = newLee
 	slot.HatchThread = nil
 
-	showFloatingFeedback(slotCFrame.Position, "✨ Rock Lee Hatched!", Color3.fromRGB(255, 230, 80))
+	showFloatingFeedback(eggPos, "✨ Rock Lee Hatched!", Color3.fromRGB(255, 230, 80))
 	startLeeWanderingAI(newLee, penInfo)
 end
 
--- Place an egg from the player's inventory onto their pen platform (at clicked location or next slot)
+-- Checks whether a candidate platform spot is clear of overlapping placed eggs
+local function isPlatformSpotClear(penInfo: PenInfo, testX: number, testZ: number, candidateRadius: number): boolean
+	local eggArea = penInfo.EggArea
+	for _, slot in pairs(penInfo.Slots) do
+		if slot and slot.Type == "Egg" and slot.Model and slot.Model.Parent then
+			local existingLocal = eggArea.CFrame:PointToObjectSpace(slot.Model:GetPivot().Position)
+			local existingScale = tonumber(slot.Model:GetAttribute("Scale")) or 1.0
+			local existingRadius = math.max(1.8, 2.2 * existingScale)
+			local minDist = candidateRadius + existingRadius + 0.3
+			local dx = testX - existingLocal.X
+			local dz = testZ - existingLocal.Z
+			if (dx * dx + dz * dz) < (minDist * minDist) then
+				return false
+			end
+		end
+	end
+	return true
+end
+
+-- Searches for a nearby free spot on the pen platform, starting at (targetX, targetZ) and spiraling outward
+local function findNearbyFreePlatformSpot(penInfo: PenInfo, targetX: number, targetZ: number, candidateRadius: number): (number?, number?)
+	local eggArea = penInfo.EggArea
+	local halfX = eggArea.Size.X / 2
+	local halfZ = eggArea.Size.Z / 2
+	local marginX = math.max(1.2, candidateRadius * 0.7)
+	local marginZ = math.max(1.2, candidateRadius * 0.7)
+	local usableX = math.max(1, halfX - marginX)
+	local usableZ = math.max(1, halfZ - marginZ)
+
+	local startX = math.clamp(targetX, -usableX, usableX)
+	local startZ = math.clamp(targetZ, -usableZ, usableZ)
+
+	if isPlatformSpotClear(penInfo, startX, startZ, candidateRadius) then
+		return startX, startZ
+	end
+
+	local searchStep = 1.2
+	local maxRadius = math.max(halfX, halfZ) * 1.8
+	for r = searchStep, maxRadius, searchStep do
+		local angleSteps = math.max(8, math.floor(2 * math.pi * r / searchStep))
+		local angleDelta = (2 * math.pi) / angleSteps
+		for i = 0, angleSteps - 1 do
+			local theta = i * angleDelta
+			local cx = startX + r * math.cos(theta)
+			local cz = startZ + r * math.sin(theta)
+			if math.abs(cx) <= usableX and math.abs(cz) <= usableZ then
+				if isPlatformSpotClear(penInfo, cx, cz, candidateRadius) then
+					return cx, cz
+				end
+			end
+		end
+	end
+
+	return nil, nil
+end
+
+-- Place an egg from the player's inventory onto their pen platform (at clicked location or free spot)
 placeEggInPen = function(player: Player, penInfo: PenInfo, eggData: any?, customCFrame: CFrame?): boolean
 	local currentCount = getPlacedItemCount(penInfo)
 	if currentCount >= GameplayConfig.Eggs.MaxPlacedCapacity then
@@ -2238,10 +2524,20 @@ placeEggInPen = function(player: Player, penInfo: PenInfo, eggData: any?, custom
 
 	local eggArea = penInfo.EggArea
 	local scale = (eggData and tonumber(eggData.Scale)) or 1.0
+	local candidateRadius = math.max(1.8, 2.2 * scale)
 
 	local targetCFrame = customCFrame
 	if not targetCFrame then
-		targetCFrame = calculateSlotCFrame(eggArea, slotIndex)
+		local fx, fz = findNearbyFreePlatformSpot(penInfo, 0, 0, candidateRadius)
+		if not fx or not fz then
+			showFloatingFeedback(eggArea.Position + Vector3.new(0, 2, 0),
+				"Pen platform is full or too crowded!", Color3.fromRGB(255, 75, 75))
+			return false
+		end
+		local localY = (eggArea.Size.Y / 2) + (1.77 * scale) + 0.05
+		local worldPos = eggArea.CFrame:PointToWorldSpace(Vector3.new(fx, localY, fz))
+		local randYaw = math.rad(math.random(0, 360))
+		targetCFrame = CFrame.new(worldPos) * CFrame.Angles(0, randYaw, 0)
 	end
 
 	local eggPrototype = Workspace:FindFirstChild("egg")
@@ -2250,7 +2546,7 @@ placeEggInPen = function(player: Player, penInfo: PenInfo, eggData: any?, custom
 	local placedEgg = eggPrototype:Clone()
 	placedEgg.Name = string.format("PlacedEgg_%d", slotIndex)
 
-	-- Ensure all parts in placed egg are completely NON-COLLIDABLE
+	-- Ensure all parts in placed egg are completely NON-COLLIDABLE and non-blocking
 	for _, p in ipairs(placedEgg:GetDescendants()) do
 		if p:IsA("BasePart") then
 			p.Anchored = true
@@ -2265,6 +2561,7 @@ placeEggInPen = function(player: Player, penInfo: PenInfo, eggData: any?, custom
 			placedEgg:ScaleTo(scale)
 		end)
 	end
+	placedEgg:SetAttribute("Scale", scale)
 
 	placedEgg:PivotTo(targetCFrame)
 	placedEgg.Parent = penInfo.Model
@@ -2357,16 +2654,18 @@ placeEggFromInventory = function(player: Player, penInfo: PenInfo): boolean
 	local eggTool: Tool? = nil
 	if player:FindFirstChild("Backpack") then
 		for _, item in ipairs(player.Backpack:GetChildren()) do
-			if item:IsA("Tool") and item:GetAttribute("IsAnimeEgg") == true then
+			if item:IsA("Tool") and (item:GetAttribute("IsAnimeEgg") == true or item.Name:lower():find("egg")) then
 				eggTool = item
 				break
 			end
 		end
 	end
 	if not eggTool and player.Character then
-		local item = player.Character:FindFirstChildWhichIsA("Tool")
-		if item and item:GetAttribute("IsAnimeEgg") == true then
-			eggTool = item
+		for _, item in ipairs(player.Character:GetChildren()) do
+			if item:IsA("Tool") and (item:GetAttribute("IsAnimeEgg") == true or item.Name:lower():find("egg")) then
+				eggTool = item
+				break
+			end
 		end
 	end
 
@@ -2375,7 +2674,14 @@ placeEggFromInventory = function(player: Player, penInfo: PenInfo): boolean
 		eggData = {
 			SizeTier = eggTool:GetAttribute("SizeTier") or "Small",
 			Scale = tonumber(eggTool:GetAttribute("Scale")) or 1.0,
-			Name = eggTool:GetAttribute("TierName") or "Anime Egg",
+			Name = eggTool:GetAttribute("TierName") or eggTool.Name,
+		}
+	elseif playerCarriedEgg[player] then
+		local c = playerCarriedEgg[player]
+		eggData = {
+			SizeTier = (c.EggData and c.EggData.SizeTier) or "Small",
+			Scale = tonumber(c.EggData and c.EggData.Scale) or 1.0,
+			Name = (c.EggData and c.EggData.Name) or "Anime Egg",
 		}
 	elseif _G.PlayerData and _G.PlayerData.getEggInventory and #_G.PlayerData.getEggInventory(player) > 0 then
 		local inv = _G.PlayerData.getEggInventory(player)
@@ -2397,11 +2703,24 @@ placeEggFromInventory = function(player: Player, penInfo: PenInfo): boolean
 
 	local placed = placeEggInPen(player, penInfo, eggData)
 	if placed then
-		if eggTool then
+		if eggTool and eggTool.Parent then
 			eggTool:Destroy()
 		end
 		if _G.PlayerData and _G.PlayerData.removeEggFromInventory then
 			_G.PlayerData.removeEggFromInventory(player, eggData)
+		end
+		if playerCarriedEgg[player] then
+			if playerCarriedEgg[player].Model and playerCarriedEgg[player].Model.Parent then
+				playerCarriedEgg[player].Model:Destroy()
+			end
+			playerCarriedEgg[player] = nil
+			player:SetAttribute("CarryingEgg", false)
+			if _G.PlayerData and _G.PlayerData.applyWalkSpeed then
+				_G.PlayerData.applyWalkSpeed(player)
+			else
+				local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+				if hum then hum.WalkSpeed = 16 end
+			end
 		end
 		return true
 	end
@@ -2424,28 +2743,34 @@ placeEggAtLocationRemote.OnServerEvent:Connect(function(player: Player, hitPosit
 	local hum = char and char:FindFirstChildOfClass("Humanoid")
 	if not root or not hum or hum.Health <= 0 then return end
 
+	local penCF, penSize = pen.Model:GetBoundingBox()
+	local playerPenRel = penCF:PointToObjectSpace(root.Position)
+	local isPlayerInsidePen = (math.abs(playerPenRel.X) <= (penSize.X / 2) + 20.0) and (math.abs(playerPenRel.Z) <= (penSize.Z / 2) + 20.0)
 	local playerDist = (root.Position - pen.EggArea.Position).Magnitude
-	local maxAllowedDist = math.max(35, pen.EggArea.Size.Magnitude / 2 + 15)
-	if playerDist > maxAllowedDist then
+	if not isPlayerInsidePen and playerDist > 120 then
 		showFloatingFeedback(root.Position + Vector3.new(0, 2.5, 0), "Too far from your pen!", Color3.fromRGB(255, 100, 100))
 		return
 	end
 
 	local now = os.clock()
 	local last = lastPlaceTime[player] or 0
-	if (now - last) < 0.35 then
+	if (now - last) < 0.25 then
 		return
 	end
 	lastPlaceTime[player] = now
 
 	local eggArea = pen.EggArea
 	local rel = eggArea.CFrame:PointToObjectSpace(hitPosition)
-	local halfX = (eggArea.Size.X / 2) + 2.5
-	local halfZ = (eggArea.Size.Z / 2) + 2.5
+	local halfX = eggArea.Size.X / 2
+	local halfZ = eggArea.Size.Z / 2
 
-	-- Check if click is anywhere in or on the pen platform
-	if math.abs(rel.X) > halfX or math.abs(rel.Z) > halfZ then
-		showFloatingFeedback(hitPosition, "Tap inside your pen platform to place this egg!", Color3.fromRGB(255, 200, 80))
+	-- Validate that the clicked position is inside the player's pen or near egg area
+	local penRel = penCF:PointToObjectSpace(hitPosition)
+	local isInsidePen = (math.abs(penRel.X) <= (penSize.X / 2) + 12.0) and (math.abs(penRel.Z) <= (penSize.Z / 2) + 12.0)
+	local isNearEggArea = (math.abs(rel.X) <= (halfX + 12.0)) and (math.abs(rel.Z) <= (halfZ + 12.0))
+
+	if not isInsidePen and not isNearEggArea then
+		showFloatingFeedback(hitPosition, "Tap inside your pen to place this egg!", Color3.fromRGB(255, 200, 80))
 		return
 	end
 
@@ -2457,26 +2782,22 @@ placeEggAtLocationRemote.OnServerEvent:Connect(function(player: Player, hitPosit
 		return
 	end
 
-	-- Clamp within usable margins
-	local usableX = math.max(1, (eggArea.Size.X / 2) - 2.0)
-	local usableZ = math.max(1, (eggArea.Size.Z / 2) - 2.0)
-	local clampedX = math.clamp(rel.X, -usableX, usableX)
-	local clampedZ = math.clamp(rel.Z, -usableZ, usableZ)
-
-	-- Find egg tool or inventory egg
+	-- Find egg tool (equipped first, then backpack) or inventory egg or carried egg
 	local eggTool: Tool? = nil
-	if player:FindFirstChild("Backpack") then
-		for _, item in ipairs(player.Backpack:GetChildren()) do
-			if item:IsA("Tool") and item:GetAttribute("IsAnimeEgg") == true then
+	if player.Character then
+		for _, item in ipairs(player.Character:GetChildren()) do
+			if item:IsA("Tool") and (item:GetAttribute("IsAnimeEgg") == true or item.Name:lower():find("egg")) then
 				eggTool = item
 				break
 			end
 		end
 	end
-	if not eggTool and player.Character then
-		local item = player.Character:FindFirstChildWhichIsA("Tool")
-		if item and item:GetAttribute("IsAnimeEgg") == true then
-			eggTool = item
+	if not eggTool and player:FindFirstChild("Backpack") then
+		for _, item in ipairs(player.Backpack:GetChildren()) do
+			if item:IsA("Tool") and (item:GetAttribute("IsAnimeEgg") == true or item.Name:lower():find("egg")) then
+				eggTool = item
+				break
+			end
 		end
 	end
 
@@ -2485,7 +2806,14 @@ placeEggAtLocationRemote.OnServerEvent:Connect(function(player: Player, hitPosit
 		eggData = {
 			SizeTier = eggTool:GetAttribute("SizeTier") or "Small",
 			Scale = tonumber(eggTool:GetAttribute("Scale")) or 1.0,
-			Name = eggTool:GetAttribute("TierName") or "Anime Egg",
+			Name = eggTool:GetAttribute("TierName") or eggTool.Name,
+		}
+	elseif playerCarriedEgg[player] then
+		local c = playerCarriedEgg[player]
+		eggData = {
+			SizeTier = (c.EggData and c.EggData.SizeTier) or "Small",
+			Scale = tonumber(c.EggData and c.EggData.Scale) or 1.0,
+			Name = (c.EggData and c.EggData.Name) or "Anime Egg",
 		}
 	elseif _G.PlayerData and _G.PlayerData.getEggInventory and #_G.PlayerData.getEggInventory(player) > 0 then
 		local inv = _G.PlayerData.getEggInventory(player)
@@ -2505,19 +2833,47 @@ placeEggAtLocationRemote.OnServerEvent:Connect(function(player: Player, hitPosit
 		return
 	end
 
-	local scale = eggData.Scale or 1.0
-	local targetY = eggArea.Size.Y / 2 + 1.0
+	local scale = tonumber(eggData.Scale) or 1.0
+	local candidateRadius = math.max(1.8, 2.2 * scale)
+
+	-- Check if spot is occupied and find nearby free position if needed
+	local freeX, freeZ = findNearbyFreePlatformSpot(pen, rel.X, rel.Z, candidateRadius)
+	if not freeX or not freeZ then
+		local marginX = math.max(1.2, candidateRadius * 0.7)
+		local marginZ = math.max(1.2, candidateRadius * 0.7)
+		local usableX = math.max(1, halfX - marginX)
+		local usableZ = math.max(1, halfZ - marginZ)
+		freeX = math.clamp(rel.X, -usableX, usableX)
+		freeZ = math.clamp(rel.Z, -usableZ, usableZ)
+	end
+
+	-- Upright CFrame with bottom sitting just above the platform floor
+	local localY = (eggArea.Size.Y / 2) + (1.77 * scale) + 0.05
+	local worldPos = eggArea.CFrame:PointToWorldSpace(Vector3.new(freeX, localY, freeZ))
 	local randYaw = math.rad(math.random(0, 360))
-	local targetCFrame = eggArea.CFrame * CFrame.new(clampedX, targetY, clampedZ) * CFrame.Angles(0, randYaw, 0)
+	local targetCFrame = CFrame.new(worldPos) * CFrame.Angles(0, randYaw, 0)
 
 	local placed = placeEggInPen(player, pen, eggData, targetCFrame)
 	if placed then
-		if eggTool then
+		if eggTool and eggTool.Parent then
 			eggTool:Destroy()
 		end
 		if _G.PlayerData and _G.PlayerData.removeEggFromInventory then
 			_G.PlayerData.removeEggFromInventory(player, eggData)
 		end
+		if playerCarriedEgg[player] then
+			if playerCarriedEgg[player].Model and playerCarriedEgg[player].Model.Parent then
+				playerCarriedEgg[player].Model:Destroy()
+			end
+			playerCarriedEgg[player] = nil
+			player:SetAttribute("CarryingEgg", false)
+			if _G.PlayerData and _G.PlayerData.applyWalkSpeed then
+				_G.PlayerData.applyWalkSpeed(player)
+			else
+				if hum then hum.WalkSpeed = 16 end
+			end
+		end
+		showFloatingFeedback(worldPos + Vector3.new(0, 2.5, 0), "🥚 Egg Placed!", Color3.fromRGB(80, 255, 120))
 	end
 end)
 
@@ -2641,11 +2997,13 @@ local function pickRandomEggTier()
 	end
 end
 
--- Find all 'egg spawn' parts placed in any zone
-local function findEggSpawnParts(): { BasePart }
+-- Find all 'egg spawn' parts strictly inside Zone1
+findEggSpawnParts = function(): { BasePart }
 	local spawns: { BasePart } = {}
-	local function checkContainer(container: Instance)
-		for _, desc in ipairs(container:GetDescendants()) do
+	local zones = Workspace:FindFirstChild("Zones")
+	local zone1 = zones and zones:FindFirstChild("Zone1") or Workspace:FindFirstChild("Zone1")
+	if zone1 then
+		for _, desc in ipairs(zone1:GetDescendants()) do
 			if desc.Name:lower():match("egg%s*spawn") then
 				if desc:IsA("BasePart") then
 					if not table.find(spawns, desc) then
@@ -2658,16 +3016,6 @@ local function findEggSpawnParts(): { BasePart }
 					end
 				end
 			end
-		end
-	end
-
-	local zones = Workspace:FindFirstChild("Zones")
-	if zones then
-		checkContainer(zones)
-	end
-	for _, obj in ipairs(Workspace:GetChildren()) do
-		if obj:IsA("Model") and obj.Name:lower():match("zone") then
-			checkContainer(obj)
 		end
 	end
 	return spawns
@@ -2691,37 +3039,26 @@ spawnZone1Eggs = function()
 	local baseExtents = getEggExtents()
 	local eggSpawnParts = findEggSpawnParts()
 
+	local zones = Workspace:FindFirstChild("Zones")
+	local zone1 = zones and zones:FindFirstChild("Zone1") or Workspace:FindFirstChild("Zone1")
+	local barrier: BasePart? = nil
+	local barrierInstance = (zone1 and zone1:FindFirstChild("NightBarrier", true))
+		or Workspace:FindFirstChild("NightBarrier", true)
+	if barrierInstance and barrierInstance:IsA("BasePart") then
+		barrier = barrierInstance
+	end
+	local zoneArea: BasePart? = nil
+	if zone1 then
+		local areaInstance = zone1:FindFirstChild("ZoneArea", true) or zone1:FindFirstChild("Area", true)
+		if areaInstance and areaInstance:IsA("BasePart") then
+			zoneArea = areaInstance
+		end
+	end
+
 	if #eggSpawnParts > 0 then
 		local eggsPerSpawn = GameplayConfig.Eggs.EggsPerSpawn or 10
 
 		for _, spawnPart in ipairs(eggSpawnParts) do
-			-- Resolve the actual zone containing this spawn part instead of using
-			-- the first ancestor Model (which may be a decorative sub-model).
-			local zoneContainer: Instance? = nil
-			local zones = Workspace:FindFirstChild("Zones")
-			if zones then
-				for _, zone in ipairs(zones:GetChildren()) do
-					if spawnPart:IsDescendantOf(zone) then
-						zoneContainer = zone
-						break
-					end
-				end
-			end
-			local zoneName = zoneContainer and zoneContainer.Name or "Zone1"
-			local barrier: BasePart? = nil
-			local barrierInstance = (zoneContainer and zoneContainer:FindFirstChild("NightBarrier", true))
-				or Workspace:FindFirstChild("NightBarrier", true)
-			if barrierInstance and barrierInstance:IsA("BasePart") then
-				barrier = barrierInstance
-			end
-			local zoneArea: BasePart? = nil
-			if zoneContainer then
-				local areaInstance = zoneContainer:FindFirstChild("ZoneArea", true) or zoneContainer:FindFirstChild("Area", true)
-				if areaInstance and areaInstance:IsA("BasePart") then
-					zoneArea = areaInstance
-				end
-			end
-
 			local existingCount = 0
 			for _, egg in ipairs(worldEggsFolder:GetChildren()) do
 				if (egg:GetPivot().Position - spawnPart.Position).Magnitude < math.max(spawnPart.Size.Magnitude, 15) then
@@ -2736,17 +3073,13 @@ spawnZone1Eggs = function()
 				local eggExtents = baseExtents * scale
 				local spawnCF: CFrame? = getSpawnCFrameOnEggSpawn(spawnPart, eggExtents)
 
-				-- Named spawn parts used to bypass the fallback floor safety check.
-				-- If one overlaps a NightBarrier, move the egg to a safe floor point;
-				-- if no safe point can be found, skip this spawn rather than spawning
-				-- an egg on top of the barrier.
 				if barrier and isOverlappingNightBarrier(spawnCF.Position, eggExtents, barrier) then
 					local safePos = zoneArea and findSafeZone1FloorSpawn(zoneArea, barrier, eggExtents)
 					spawnCF = safePos and CFrame.new(safePos) or nil
 				end
 
 				if spawnCF then
-					spawnSingleWorldEgg(zoneName, spawnCF, {
+					spawnSingleWorldEgg("Zone1", spawnCF, {
 						SizeTier = tierKey,
 						Scale = scale,
 						Name = tierData.Name,
@@ -2757,11 +3090,6 @@ spawnZone1Eggs = function()
 		end
 	else
 		-- Fallback to Zone1 floor
-		local zones = Workspace:FindFirstChild("Zones")
-		local zone1 = zones and zones:FindFirstChild("Zone1") or Workspace:FindFirstChild("Zone1")
-		local zoneArea = zone1 and (zone1:FindFirstChild("ZoneArea", true) or zone1:FindFirstChild("Area", true)) :: BasePart?
-		local barrier = (zone1 and zone1:FindFirstChild("NightBarrier", true))
-			or (Workspace:FindFirstChild("NightBarrier", true)) :: BasePart?
 		if not zoneArea then return end
 
 		local targetCount = GameplayConfig.Eggs.Zone1SpawnCount or 15
@@ -2840,52 +3168,9 @@ Lighting:GetAttributeChangedSignal("Phase"):Connect(function()
 	end
 end)
 
--- Hook restored egg tools in Backpack so they can be placed
+-- Restored egg tools in Backpack are handled client-side via PlaceEggAtLocation RemoteEvent
 local function setupPlayerEggToolHook(player: Player)
-	local function checkItem(item: Instance)
-		if item:IsA("Tool") and item:GetAttribute("IsAnimeEgg") == true and not item:GetAttribute("ActivatedHooked") then
-			item:SetAttribute("ActivatedHooked", true)
-			item.Activated:Connect(function()
-				local pen = playerPenMap[player]
-				if not pen then return end
-				local char = player.Character
-				local root = char and char:FindFirstChild("HumanoidRootPart") :: BasePart?
-				if not root then return end
-				local dist = (root.Position - pen.EggArea.Position).Magnitude
-				local maxDist = math.max(25, pen.EggArea.Size.Magnitude / 2 + 10)
-				if dist <= maxDist then
-					local currentCount = getPlacedItemCount(pen)
-					if currentCount < GameplayConfig.Eggs.MaxPlacedCapacity then
-						local eggData = {
-							SizeTier = item:GetAttribute("SizeTier") or "Small",
-							Scale = item:GetAttribute("Scale") or 1.0,
-							Name = item:GetAttribute("TierName") or "Anime Egg",
-						}
-						local placed = placeEggInPen(player, pen, eggData)
-						if placed then
-							item:Destroy()
-							if _G.PlayerData and _G.PlayerData.removeEggFromInventory then
-								_G.PlayerData.removeEggFromInventory(player, eggData)
-							end
-						end
-					end
-				end
-			end)
-		end
-	end
-
-	local function hookBackpack(backpack: Instance)
-		for _, child in ipairs(backpack:GetChildren()) do
-			checkItem(child)
-		end
-		backpack.ChildAdded:Connect(checkItem)
-	end
-
-	local bp = player:FindFirstChild("Backpack")
-	if bp then hookBackpack(bp) end
-	player.ChildAdded:Connect(function(c)
-		if c.Name == "Backpack" then hookBackpack(c) end
-	end)
+	-- No server-side click hijacking; placement is strictly freeform via PlaceEggAtLocation remote
 end
 
 -- Player join/leave lifecycle

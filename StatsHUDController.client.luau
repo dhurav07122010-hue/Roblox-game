@@ -276,8 +276,8 @@ local function updatePenTrainingVisibility(pen: Model)
 	local ownerId = pen:GetAttribute("OwnerUserId") or 0
 	local ownerName = pen:GetAttribute("OwnerName") or ""
 	local isOwner = (myUserId ~= 0 and ownerId ~= 0 and ownerId == myUserId) or (ownerName ~= "" and ownerName == player.Name)
-	local isBeingUsed = (pen:GetAttribute("IsTraining") == true)
-	local shouldBeVisible = isOwner or isBeingUsed
+	-- Strict: pen up sign, dumbbell sign, dumbbell, and training pad appear ONLY to owner!
+	local shouldBeVisible = isOwner
 
 	for _, item in ipairs(cache.items) do
 		if item and item.Parent then
@@ -297,9 +297,11 @@ local function rebuildPenTrainingCache(pen: Model)
 		end
 	end
 
-	-- Only check explicit training items if somehow outside folder (ordinary pen signs are never touched)
+	-- Strict Owner Isolation: Pen upgrade signs, training upgrade signs, dumbbells, and pads appear ONLY to the owner
 	for _, child in ipairs(pen:GetChildren()) do
-		if child.Name == "TrainingPad" or child.Name == "TrainingDumbbell" or child.Name == "TrainingUpgradeSign" then
+		local nameL = child.Name:lower()
+		if child.Name == "TrainingPad" or child.Name == "TrainingDumbbell" or child.Name == "TrainingUpgradeSign"
+			or child.Name == "PenUpgradeSign" or nameL:find("dumbel%s*up") or nameL:find("pen%s*up") then
 			if not table.find(items, child) then
 				table.insert(items, child)
 				for _, d in ipairs(child:GetDescendants()) do
@@ -334,6 +336,11 @@ local function hookPen(pen: Model)
 			rebuildPenTrainingCache(pen)
 		end)
 	end)
+	pen:GetAttributeChangedSignal("PenUpgradeLevel"):Connect(function()
+		task.defer(function()
+			rebuildPenTrainingCache(pen)
+		end)
+	end)
 
 	local function hookTrainingArea(ta: Instance)
 		ta.DescendantAdded:Connect(function()
@@ -354,8 +361,10 @@ local function hookPen(pen: Model)
 	end
 
 	pen.ChildAdded:Connect(function(child)
+		local nameL = child.Name:lower()
 		if child.Name == "StrengthTrainingArea" or child.Name == "TrainingPad"
-			or child.Name == "TrainingDumbbell" or child.Name == "TrainingUpgradeSign" then
+			or child.Name == "TrainingDumbbell" or child.Name == "TrainingUpgradeSign"
+			or child.Name == "PenUpgradeSign" or nameL:find("dumbel%s*up") or nameL:find("pen%s*up") then
 			if child.Name == "StrengthTrainingArea" then
 				hookTrainingArea(child)
 			end
@@ -366,22 +375,30 @@ local function hookPen(pen: Model)
 	end)
 end
 
-local function hideLooseDumbbell(model: Instance)
+local function hideLooseTemplate(model: Instance)
 	if model:IsA("Model") then
 		for _, desc in ipairs(model:GetDescendants()) do
 			if desc:IsA("BasePart") then
 				desc.Transparency = 1
 				desc.CanCollide = false
+			elseif desc:IsA("SurfaceGui") then
+				desc.Enabled = false
+			elseif desc:IsA("GuiObject") then
+				desc.Visible = false
 			end
 		end
 	end
 end
 
 local function hideWorkspacePrototypes()
-	for _, name in ipairs({"dumbel1", "dumbel2", "dumbel3", "Dumbel1", "Dumbel2", "Dumbel3"}) do
+	for _, name in ipairs({
+		"dumbel1", "dumbel2", "dumbel3", "Dumbel1", "Dumbel2", "Dumbel3",
+		"dumbel up1", "dumbel up2", "dumbel up3", "dumbel up4", "dumbel up5",
+		"pen up1", "pen up2", "pen up3", "pen up4", "pen up5",
+	}) do
 		local proto = Workspace:FindFirstChild(name)
 		if proto then
-			hideLooseDumbbell(proto)
+			hideLooseTemplate(proto)
 		end
 	end
 end
@@ -392,8 +409,8 @@ task.spawn(function()
 
 	Workspace.ChildAdded:Connect(function(child)
 		local nameL = child.Name:lower()
-		if nameL == "dumbel1" or nameL == "dumbel2" or nameL == "dumbel3" then
-			hideLooseDumbbell(child)
+		if nameL == "dumbel1" or nameL == "dumbel2" or nameL == "dumbel3" or nameL:find("dumbel up") or nameL:find("pen up") then
+			hideLooseTemplate(child)
 		elseif child:IsA("Model") and nameL:match("pen%s*%d") then
 			hookPen(child)
 		end
@@ -504,24 +521,113 @@ if not placeEggRemote then
 	placeEggRemote.Parent = ReplicatedStorage
 end
 
-local function handleTapToPlace(input: InputObject, gameProcessed: boolean)
-	if gameProcessed then return end
-	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-		local char = player.Character
-		local tool = char and char:FindFirstChildWhichIsA("Tool")
-		if tool and tool:GetAttribute("IsAnimeEgg") == true then
-			local mouse = player:GetMouse()
-			if mouse and mouse.Hit then
-				local remote = ReplicatedStorage:FindFirstChild("PlaceEggAtLocation") :: RemoteEvent?
-				if remote then
-					remote:FireServer(mouse.Hit.Position)
+local function hookEggToolClient(item: Instance)
+	if item:IsA("Tool") and item:GetAttribute("IsAnimeEgg") == true then
+		if not item:GetAttribute("ClientActivatedHooked") then
+			item:SetAttribute("ClientActivatedHooked", true)
+			item.Activated:Connect(function()
+				local mouse = player:GetMouse()
+				if mouse and mouse.Hit then
+					placeEggRemote:FireServer(mouse.Hit.Position)
 				end
-			end
+			end)
 		end
 	end
 end
 
-UserInputService.InputBegan:Connect(handleTapToPlace)
+local function hookBackpackClient(backpack: Instance)
+	for _, child in ipairs(backpack:GetChildren()) do
+		hookEggToolClient(child)
+	end
+	backpack.ChildAdded:Connect(hookEggToolClient)
+end
+
+local function hookCharacterClient(char: Model)
+	for _, child in ipairs(char:GetChildren()) do
+		hookEggToolClient(child)
+	end
+	char.ChildAdded:Connect(hookEggToolClient)
+end
+
+if player.Character then
+	hookCharacterClient(player.Character)
+end
+player.CharacterAdded:Connect(hookCharacterClient)
+
+local bp = player:FindFirstChild("Backpack")
+if bp then
+	hookBackpackClient(bp)
+end
+player.ChildAdded:Connect(function(c)
+	if c.Name == "Backpack" then
+		hookBackpackClient(c)
+	end
+end)
+
+local function isGuiAtScreenPoint(screenX: number, screenY: number): boolean
+	local pGui = player:FindFirstChild("PlayerGui")
+	if not pGui then return false end
+	local guis = pGui:GetGuiObjectsAtPosition(screenX, screenY)
+	for _, g in ipairs(guis) do
+		if g:IsA("GuiButton") or (g:IsA("Frame") and g.Active) or (g:IsA("TextBox") and g.Visible) then
+			return true
+		end
+	end
+	return false
+end
+
+local function firePlaceEggAtScreenPoint(screenX: number, screenY: number)
+	if isGuiAtScreenPoint(screenX, screenY) then
+		return
+	end
+
+	local hitPos: Vector3? = nil
+	local mouse = player:GetMouse()
+	if mouse and mouse.Hit then
+		hitPos = mouse.Hit.Position
+	elseif Workspace.CurrentCamera then
+		local unitRay = Workspace.CurrentCamera:ScreenPointToRay(screenX, screenY)
+		local rayParams = RaycastParams.new()
+		rayParams.FilterType = Enum.RaycastFilterType.Exclude
+		if player.Character then
+			rayParams.FilterDescendantsInstances = { player.Character }
+		end
+		local rayHit = Workspace:Raycast(unitRay.Origin, unitRay.Direction * 1000, rayParams)
+		if rayHit then
+			hitPos = rayHit.Position
+		end
+	end
+
+	if hitPos then
+		placeEggRemote:FireServer(hitPos)
+	end
+end
+
+-- 1. Direct Mouse Button 1 Down (Reliable desktop world click without gameProcessed suppression)
+local clientMouse = player:GetMouse()
+clientMouse.Button1Down:Connect(function()
+	local mPos = UserInputService:GetMouseLocation()
+	if not isGuiAtScreenPoint(mPos.X, mPos.Y) then
+		if clientMouse.Hit then
+			placeEggRemote:FireServer(clientMouse.Hit.Position)
+		end
+	end
+end)
+
+-- 2. Touch Tap (Reliable mobile / tablet tap)
+UserInputService.TouchTap:Connect(function(touchPositions, _gameProcessed)
+	local pos = touchPositions[1]
+	if pos then
+		firePlaceEggAtScreenPoint(pos.X, pos.Y)
+	end
+end)
+
+-- 3. Touch InputBegan fallback
+UserInputService.InputBegan:Connect(function(input, _gameProcessed)
+	if input.UserInputType == Enum.UserInputType.Touch and input.Position then
+		firePlaceEggAtScreenPoint(input.Position.X, input.Position.Y)
+	end
+end)
 
 --------------------------------------------------------------------------------
 -- 9. DUMBBELL UPGRADE SIGN BUTTON (CLICK BUTTON DIRECTLY ON SIGN)
@@ -541,14 +647,57 @@ if not upgradePenRemote then
 end
 
 local function hookUpgradeButton(desc: Instance)
-	if desc:IsA("GuiButton") then
-		if desc.Name == "UpgradeButton" then
-			desc.Activated:Connect(function()
-				upgradeDumbbellRemote:FireServer()
-			end)
-		elseif desc.Name == "PenUpgradeButton" or (desc.Parent and desc.Parent.Name == "Panel" and desc.Parent.Parent and desc.Parent.Parent.Name:match("^PenUpgradeGui")) then
+	if desc:IsA("GuiButton") and not desc:GetAttribute("UpgradeHooked") then
+		local isPen = false
+		local isDumbbell = false
+
+		if desc.Name == "PenUpgradeButton" then
+			isPen = true
+		elseif desc.Name == "UpgradeButton" then
+			local model = desc:FindFirstAncestorOfClass("Model")
+			if model and (model.Name:lower():find("dumbel") or model.Name == "TrainingUpgradeSign") then
+				isDumbbell = true
+			elseif model and (model.Name:lower():find("pen") or model.Name == "PenUpgradeSign") then
+				isPen = true
+			else
+				isDumbbell = true
+			end
+		end
+
+		local model = desc:FindFirstAncestorOfClass("Model")
+		if model then
+			local mName = model.Name:lower()
+			if mName:find("pen up") or mName:find("penupgrade") then
+				isPen = true
+			elseif mName:find("dumbel") or mName:find("trainingupgradesign") then
+				isDumbbell = true
+			end
+		end
+
+		if desc.Parent then
+			for _, sibling in ipairs(desc.Parent:GetChildren()) do
+				if sibling:IsA("TextLabel") then
+					local sText = sibling.Text:lower()
+					if sText:find("upgrade pen") then
+						isPen = true
+						break
+					elseif sText:find("upgrade dumbel") or sText:find("upgrade dumbbell") then
+						isDumbbell = true
+						break
+					end
+				end
+			end
+		end
+
+		if isPen then
+			desc:SetAttribute("UpgradeHooked", true)
 			desc.Activated:Connect(function()
 				upgradePenRemote:FireServer()
+			end)
+		elseif isDumbbell then
+			desc:SetAttribute("UpgradeHooked", true)
+			desc.Activated:Connect(function()
+				upgradeDumbbellRemote:FireServer()
 			end)
 		end
 	end
