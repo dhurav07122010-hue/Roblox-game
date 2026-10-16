@@ -533,11 +533,24 @@ if not upgradeDumbbellRemote then
 	upgradeDumbbellRemote.Parent = ReplicatedStorage
 end
 
+local upgradePenRemote = ReplicatedStorage:FindFirstChild("UpgradePenAction") :: RemoteEvent?
+if not upgradePenRemote then
+	upgradePenRemote = Instance.new("RemoteEvent")
+	upgradePenRemote.Name = "UpgradePenAction"
+	upgradePenRemote.Parent = ReplicatedStorage
+end
+
 local function hookUpgradeButton(desc: Instance)
-	if desc:IsA("TextButton") and desc.Name == "UpgradeButton" then
-		desc.Activated:Connect(function()
-			upgradeDumbbellRemote:FireServer()
-		end)
+	if desc:IsA("GuiButton") then
+		if desc.Name == "UpgradeButton" then
+			desc.Activated:Connect(function()
+				upgradeDumbbellRemote:FireServer()
+			end)
+		elseif desc.Name == "PenUpgradeButton" or (desc.Parent and desc.Parent.Name == "Panel" and desc.Parent.Parent and desc.Parent.Parent.Name:match("^PenUpgradeGui")) then
+			desc.Activated:Connect(function()
+				upgradePenRemote:FireServer()
+			end)
+		end
 	end
 end
 

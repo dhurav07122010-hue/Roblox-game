@@ -1060,6 +1060,14 @@ if not upgradeDumbbellRemote then
 	upgradeDumbbellRemote.Parent = ReplicatedStorage
 end
 
+-- Ensure UpgradePenAction RemoteEvent exists for pen upgrade sign interactions
+local upgradePenRemote = ReplicatedStorage:FindFirstChild("UpgradePenAction") :: RemoteEvent?
+if not upgradePenRemote then
+	upgradePenRemote = Instance.new("RemoteEvent")
+	upgradePenRemote.Name = "UpgradePenAction"
+	upgradePenRemote.Parent = ReplicatedStorage
+end
+
 -- Cooldown and debounce trackers for client-triggered actions
 local lastUpgradeTime: { [Player]: number } = {}
 local lastPlaceTime: { [Player]: number } = {}
@@ -1664,6 +1672,20 @@ local function setupPenTrainingArea(penInfo: PenInfo)
 	clickDetector.MaxActivationDistance = 14
 	clickDetector.Parent = board
 
+	local postClickDetector = Instance.new("ClickDetector")
+	postClickDetector.Name = "PostClickDetector"
+	postClickDetector.MaxActivationDistance = 14
+	postClickDetector.Parent = post
+
+	local dumbbellPrompt = Instance.new("ProximityPrompt")
+	dumbbellPrompt.Name = "DumbbellUpgradePrompt"
+	dumbbellPrompt.ObjectText = "Dumbbell"
+	dumbbellPrompt.ActionText = "Upgrade to Medium ($5,000)"
+	dumbbellPrompt.HoldDuration = 0
+	dumbbellPrompt.MaxActivationDistance = 12
+	dumbbellPrompt.RequiresLineOfSight = false
+	dumbbellPrompt.Parent = board
+
 	local function createSignGui(face: Enum.NormalId)
 		local sg = Instance.new("SurfaceGui")
 		sg.Name = "UpgradeSurfaceGui_" .. face.Name
@@ -1758,14 +1780,20 @@ local function setupPenTrainingArea(penInfo: PenInfo)
 			curText = "Current: Light (+1 Str/tick)"
 			btnText = "UPGRADE TO MEDIUM ($5,000)"
 			btnColor = Color3.fromRGB(46, 204, 113)
+			dumbbellPrompt.ActionText = "Upgrade to Medium ($5,000)"
+			dumbbellPrompt.Enabled = true
 		elseif tier == 2 then
 			curText = "Current: Medium (+5 Str/tick)"
 			btnText = "UPGRADE TO HEAVY ($25,000)"
 			btnColor = Color3.fromRGB(46, 204, 113)
+			dumbbellPrompt.ActionText = "Upgrade to Heavy ($25,000)"
+			dumbbellPrompt.Enabled = true
 		else
 			curText = "Current: Heavy (+20 Str/tick)"
 			btnText = "⭐ MAX LEVEL REACHED ⭐"
 			btnColor = Color3.fromRGB(100, 110, 125)
+			dumbbellPrompt.ActionText = "⭐ Max Level Reached ⭐"
+			dumbbellPrompt.Enabled = false
 		end
 
 		curL1.Text = curText
@@ -1892,6 +1920,10 @@ local function setupPenTrainingArea(penInfo: PenInfo)
 
 	penInfo.PerformUpgrade = performDumbbellUpgrade
 	clickDetector.MouseClick:Connect(performDumbbellUpgrade)
+	postClickDetector.MouseClick:Connect(performDumbbellUpgrade)
+	dumbbellPrompt.Triggered:Connect(function(player: Player)
+		performDumbbellUpgrade(player)
+	end)
 
 	-- Auto-detect player stepping on training pad
 	pad.Touched:Connect(function(hit)
@@ -1930,6 +1962,13 @@ upgradeDumbbellRemote.OnServerEvent:Connect(function(player: Player)
 	local pen = playerPenMap[player]
 	if pen and pen.PerformUpgrade then
 		pen.PerformUpgrade(player)
+	end
+end)
+
+upgradePenRemote.OnServerEvent:Connect(function(player: Player)
+	local pen = playerPenMap[player]
+	if pen and pen.PerformPenUpgrade then
+		pen.PerformPenUpgrade(player)
 	end
 end)
 
@@ -2005,27 +2044,43 @@ local function setupPenUpgradeGui(penInfo: PenInfo)
 		return
 	end
 
-	local signPart: BasePart? = sign.PrimaryPart
-	if not signPart then
-		local bestArea = 0
+	local signParts: { BasePart } = {}
+	if sign:IsA("BasePart") then
+		table.insert(signParts, sign)
+	else
 		for _, desc in ipairs(sign:GetDescendants()) do
 			if desc:IsA("BasePart") then
-				local area = desc.Size.X * desc.Size.Y + desc.Size.Y * desc.Size.Z + desc.Size.X * desc.Size.Z
-				if area > bestArea then
-					bestArea = area
-					signPart = desc
-				end
+				table.insert(signParts, desc)
 			end
 		end
 	end
-	if not signPart then
+
+	if #signParts == 0 then
 		warn(string.format("[GameplayManager] Pen %d sign has no BasePart; skipping pen upgrade GUI.", penInfo.Index))
 		return
 	end
 
-	for _, child in ipairs(signPart:GetChildren()) do
-		if child.Name:match("^PenUpgradeGui") or child.Name == "PenUpgradeClickDetector" then
-			child:Destroy()
+	local signPart: BasePart? = sign.PrimaryPart
+	if not signPart then
+		local bestScore = -math.huge
+		for _, part in ipairs(signParts) do
+			local area = part.Size.X * part.Size.Y + part.Size.Y * part.Size.Z + part.Size.X * part.Size.Z
+			local score = area * 10 + part.Position.Y * 20
+			if score > bestScore then
+				bestScore = score
+				signPart = part
+			end
+		end
+	end
+	if not signPart then
+		signPart = signParts[1]
+	end
+
+	for _, p in ipairs(signParts) do
+		for _, child in ipairs(p:GetChildren()) do
+			if child.Name:match("^PenUpgradeGui") or child.Name:match("^PenUpgradeClick") or child.Name == "PenUpgradePrompt" then
+				child:Destroy()
+			end
 		end
 	end
 
@@ -2103,11 +2158,17 @@ local function setupPenUpgradeGui(penInfo: PenInfo)
 
 	createGuiOnFace(Enum.NormalId.Front, "Front")
 	createGuiOnFace(Enum.NormalId.Back, "Back")
+	createGuiOnFace(Enum.NormalId.Left, "Left")
+	createGuiOnFace(Enum.NormalId.Right, "Right")
 
-	local click = Instance.new("ClickDetector")
-	click.Name = "PenUpgradeClickDetector"
-	click.MaxActivationDistance = 16
-	click.Parent = signPart
+	local penPrompt = Instance.new("ProximityPrompt")
+	penPrompt.Name = "PenUpgradePrompt"
+	penPrompt.ObjectText = "Pen"
+	penPrompt.ActionText = "Upgrade Pen ($5,000)"
+	penPrompt.HoldDuration = 0
+	penPrompt.MaxActivationDistance = 14
+	penPrompt.RequiresLineOfSight = false
+	penPrompt.Parent = signPart
 
 	local function refresh()
 		local level = (_G.PlayerData and _G.PlayerData.getPenUpgradeLevel and penInfo.Owner)
@@ -2126,9 +2187,14 @@ local function setupPenUpgradeGui(penInfo: PenInfo)
 		if level >= 5 then
 			actionText = "MAX LEVEL"
 			actionColor = Color3.fromRGB(90, 100, 115)
+			penPrompt.ActionText = "⭐ Max Level (11 Pets) ⭐"
+			penPrompt.Enabled = false
 		else
-			actionText = string.format("UPGRADE  $%d", PEN_UPGRADE_COSTS[level + 1])
+			local cost = PEN_UPGRADE_COSTS[level + 1]
+			actionText = string.format("UPGRADE  $%d", cost)
 			actionColor = Color3.fromRGB(46, 180, 92)
+			penPrompt.ActionText = string.format("Upgrade Pen ($%d) • Pet Limit %d", cost, 6 + level + 1)
+			penPrompt.Enabled = true
 		end
 
 		for _, lbl in ipairs(levelLabels) do
@@ -2177,7 +2243,19 @@ local function setupPenUpgradeGui(penInfo: PenInfo)
 			Color3.fromRGB(80, 255, 120))
 	end
 
-	click.MouseClick:Connect(performPenUpgrade)
+	for idx, p in ipairs(signParts) do
+		local click = Instance.new("ClickDetector")
+		click.Name = "PenUpgradeClickDetector_" .. idx
+		click.MaxActivationDistance = 16
+		click.Parent = p
+		click.MouseClick:Connect(performPenUpgrade)
+	end
+
+	penPrompt.Triggered:Connect(function(player: Player)
+		performPenUpgrade(player)
+	end)
+
+	penInfo.PerformPenUpgrade = performPenUpgrade
 	penInfo.UpdatePenUpgradeDisplay = refresh
 	refresh()
 end
@@ -4326,11 +4404,24 @@ if not upgradeDumbbellRemote then
 	upgradeDumbbellRemote.Parent = ReplicatedStorage
 end
 
+local upgradePenRemote = ReplicatedStorage:FindFirstChild("UpgradePenAction") :: RemoteEvent?
+if not upgradePenRemote then
+	upgradePenRemote = Instance.new("RemoteEvent")
+	upgradePenRemote.Name = "UpgradePenAction"
+	upgradePenRemote.Parent = ReplicatedStorage
+end
+
 local function hookUpgradeButton(desc: Instance)
-	if desc:IsA("TextButton") and desc.Name == "UpgradeButton" then
-		desc.Activated:Connect(function()
-			upgradeDumbbellRemote:FireServer()
-		end)
+	if desc:IsA("GuiButton") then
+		if desc.Name == "UpgradeButton" then
+			desc.Activated:Connect(function()
+				upgradeDumbbellRemote:FireServer()
+			end)
+		elseif desc.Name == "PenUpgradeButton" or (desc.Parent and desc.Parent.Name == "Panel" and desc.Parent.Parent and desc.Parent.Parent.Name:match("^PenUpgradeGui")) then
+			desc.Activated:Connect(function()
+				upgradePenRemote:FireServer()
+			end)
+		end
 	end
 end
 
