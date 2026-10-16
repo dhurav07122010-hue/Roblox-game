@@ -220,7 +220,7 @@ task.spawn(hookLeaderstats)
 -- 5. TRAINING AREA & DUMBBELL VISIBILITY
 -- Other players' training pads, borders, text, and dumbbells MUST be invisible.
 -- They should ONLY appear to other players if the owner is actively using it!
--- The owner sees their own pad/dumbbell.
+-- The owner sees their own pad/dumbbell. Ordinary pen signs are NOT hidden.
 --------------------------------------------------------------------------------
 local function getAllPens(): { Model }
 	local pens: { Model } = {}
@@ -243,75 +243,145 @@ local function getAllPens(): { Model }
 	return pens
 end
 
-local function updateTrainingAreaVisibility()
+local penTrainingCache: { [Model]: { folder: Instance?, items: { Instance } } } = {}
+
+local function applyItemVisibility(desc: Instance, shouldBeVisible: boolean, isOwner: boolean)
+	if desc:IsA("BasePart") then
+		desc.Transparency = shouldBeVisible and 0 or 1
+		desc.CanCollide = shouldBeVisible and isOwner
+	elseif desc:IsA("Decal") or desc:IsA("Texture") then
+		desc.Transparency = shouldBeVisible and 0 or 1
+	elseif desc:IsA("SelectionBox") then
+		desc.Transparency = shouldBeVisible and 0 or 1
+		desc.Adornee = shouldBeVisible and desc.Parent or nil
+	elseif desc:IsA("Highlight") then
+		desc.Enabled = shouldBeVisible
+	elseif desc:IsA("SurfaceGui") or desc:IsA("BillboardGui") then
+		desc.Enabled = shouldBeVisible
+	elseif desc:IsA("ProximityPrompt") then
+		desc.Enabled = shouldBeVisible and isOwner
+	elseif desc:IsA("ClickDetector") then
+		desc.MaxActivationDistance = (shouldBeVisible and isOwner) and 14 or 0
+	elseif desc:IsA("Beam") or desc:IsA("ParticleEmitter") or desc:IsA("Trail") then
+		desc.Enabled = shouldBeVisible
+	end
+end
+
+local function updatePenTrainingVisibility(pen: Model)
+	local cache = penTrainingCache[pen]
+	if not cache then return end
+
 	local myUserId = player.UserId
-	local pens = getAllPens()
+	local ownerId = pen:GetAttribute("OwnerUserId") or 0
+	local isOwner = (myUserId ~= 0 and ownerId ~= 0 and ownerId == myUserId)
+	local isBeingUsed = (pen:GetAttribute("IsTraining") == true)
+	local shouldBeVisible = isOwner or isBeingUsed
 
-	for _, pen in ipairs(pens) do
-		local ownerId = pen:GetAttribute("OwnerUserId") or 0
-		local isOwner = (myUserId ~= 0 and ownerId ~= 0 and ownerId == myUserId)
-		local isBeingUsed = (pen:GetAttribute("IsTraining") == true)
-		-- Visible to owner always, and visible to other players ONLY if owner is actively using it!
-		local shouldBeVisible = isOwner or isBeingUsed
+	for _, item in ipairs(cache.items) do
+		if item and item.Parent then
+			applyItemVisibility(item, shouldBeVisible, isOwner)
+		end
+	end
+end
 
-		local trainingArea = pen:FindFirstChild("StrengthTrainingArea")
-		for _, desc in ipairs(pen:GetDescendants()) do
-			local nameL = desc.Name:lower()
-			local isPartOfTraining = (trainingArea and desc:IsDescendantOf(trainingArea))
-				or desc.Name == "StrengthTrainingArea"
-				or nameL:find("training")
-				or nameL:find("dumbel")
-				or nameL:find("upgrade")
-				or nameL:find("sign")
+local function rebuildPenTrainingCache(pen: Model)
+	local trainingArea = pen:FindFirstChild("StrengthTrainingArea")
+	local items: { Instance } = {}
 
-			if isPartOfTraining then
-				if desc:IsA("BasePart") then
-					desc.Transparency = shouldBeVisible and 0 or 1
-					desc.CanCollide = shouldBeVisible and isOwner
-				elseif desc:IsA("Decal") or desc:IsA("Texture") then
-					desc.Transparency = shouldBeVisible and 0 or 1
-				elseif desc:IsA("SelectionBox") then
-					desc.Transparency = shouldBeVisible and 0 or 1
-					desc.Adornee = shouldBeVisible and desc.Parent or nil
-				elseif desc:IsA("Highlight") then
-					desc.Enabled = shouldBeVisible
-				elseif desc:IsA("SurfaceGui") or desc:IsA("BillboardGui") then
-					desc.Enabled = shouldBeVisible
-				elseif desc:IsA("ProximityPrompt") then
-					desc.Enabled = shouldBeVisible
-				elseif desc:IsA("ClickDetector") then
-					desc.MaxActivationDistance = shouldBeVisible and 14 or 0
-				elseif desc:IsA("Beam") or desc:IsA("ParticleEmitter") or desc:IsA("Trail") then
-					desc.Enabled = shouldBeVisible
+	if trainingArea then
+		table.insert(items, trainingArea)
+		for _, desc in ipairs(trainingArea:GetDescendants()) do
+			table.insert(items, desc)
+		end
+	end
+
+	-- Only check explicit training items if somehow outside folder (ordinary pen signs are never touched)
+	for _, child in ipairs(pen:GetChildren()) do
+		if child.Name == "TrainingPad" or child.Name == "TrainingDumbbell" or child.Name == "TrainingUpgradeSign" then
+			if not table.find(items, child) then
+				table.insert(items, child)
+				for _, d in ipairs(child:GetDescendants()) do
+					table.insert(items, d)
 				end
 			end
 		end
 	end
 
-	-- Also hide any loose prototype dumbbells in Workspace
-	for _, name in ipairs({"dumbel1", "dumbel2", "dumbel3", "Dumbel1", "Dumbel2", "Dumbel3"}) do
-		local proto = Workspace:FindFirstChild(name)
-		if proto and proto:IsA("Model") then
-			for _, desc in ipairs(proto:GetDescendants()) do
-				if desc:IsA("BasePart") then
-					desc.Transparency = 1
-					desc.CanCollide = false
-				end
+	penTrainingCache[pen] = {
+		folder = trainingArea,
+		items = items,
+	}
+
+	updatePenTrainingVisibility(pen)
+end
+
+local function hookPen(pen: Model)
+	rebuildPenTrainingCache(pen)
+
+	pen:GetAttributeChangedSignal("OwnerUserId"):Connect(function()
+		updatePenTrainingVisibility(pen)
+	end)
+	pen:GetAttributeChangedSignal("IsTraining"):Connect(function()
+		updatePenTrainingVisibility(pen)
+	end)
+
+	pen.ChildAdded:Connect(function(child)
+		if child.Name == "StrengthTrainingArea" or child.Name == "TrainingPad"
+			or child.Name == "TrainingDumbbell" or child.Name == "TrainingUpgradeSign" then
+			task.defer(function()
+				rebuildPenTrainingCache(pen)
+			end)
+		end
+	end)
+
+	local trainingArea = pen:FindFirstChild("StrengthTrainingArea")
+	if trainingArea then
+		trainingArea.DescendantAdded:Connect(function(desc)
+			local cache = penTrainingCache[pen]
+			if cache and not table.find(cache.items, desc) then
+				table.insert(cache.items, desc)
+				local myUserId = player.UserId
+				local ownerId = pen:GetAttribute("OwnerUserId") or 0
+				local isOwner = (myUserId ~= 0 and ownerId ~= 0 and ownerId == myUserId)
+				local isBeingUsed = (pen:GetAttribute("IsTraining") == true)
+				applyItemVisibility(desc, isOwner or isBeingUsed, isOwner)
+			end
+		end)
+	end
+end
+
+local function hideLooseDumbbell(model: Instance)
+	if model:IsA("Model") then
+		for _, desc in ipairs(model:GetDescendants()) do
+			if desc:IsA("BasePart") then
+				desc.Transparency = 1
+				desc.CanCollide = false
 			end
 		end
 	end
 end
 
-task.spawn(function()
-	task.wait(0.3)
-	local function hookPen(pen: Model)
-		pen:GetAttributeChangedSignal("OwnerUserId"):Connect(updateTrainingAreaVisibility)
-		pen:GetAttributeChangedSignal("IsTraining"):Connect(updateTrainingAreaVisibility)
-		pen.DescendantAdded:Connect(function()
-			task.wait(0.05)
-			updateTrainingAreaVisibility()
-		end)
+local function hideWorkspacePrototypes()
+	for _, name in ipairs({"dumbel1", "dumbel2", "dumbel3", "Dumbel1", "Dumbel2", "Dumbel3"}) do
+		local proto = Workspace:FindFirstChild(name)
+		if proto then
+			hideLooseDumbbell(proto)
+		end
 	end
+end
+
+task.spawn(function()
+	task.wait(0.2)
+	hideWorkspacePrototypes()
+
+	Workspace.ChildAdded:Connect(function(child)
+		local nameL = child.Name:lower()
+		if nameL == "dumbel1" or nameL == "dumbel2" or nameL == "dumbel3" then
+			hideLooseDumbbell(child)
+		elseif child:IsA("Model") and nameL:match("pen%s*%d") then
+			hookPen(child)
+		end
+	end)
 
 	for _, pen in ipairs(getAllPens()) do
 		hookPen(pen)
@@ -323,23 +393,8 @@ task.spawn(function()
 		pensFolder.ChildAdded:Connect(function(child)
 			if child:IsA("Model") then
 				hookPen(child)
-				updateTrainingAreaVisibility()
 			end
 		end)
-	end
-	Workspace.ChildAdded:Connect(function(child)
-		if child:IsA("Model") and child.Name:lower():match("pen%s*%d") then
-			hookPen(child)
-			updateTrainingAreaVisibility()
-		end
-	end)
-
-	updateTrainingAreaVisibility()
-
-	-- Periodic sync fallback ensures 100% visual consistency
-	while true do
-		task.wait(1.0)
-		updateTrainingAreaVisibility()
 	end
 end)
 
@@ -463,8 +518,10 @@ local function hookUpgradeButton(desc: Instance)
 	end
 end
 
-for _, desc in ipairs(Workspace:GetDescendants()) do
-	hookUpgradeButton(desc)
+for _, pen in ipairs(getAllPens()) do
+	for _, desc in ipairs(pen:GetDescendants()) do
+		hookUpgradeButton(desc)
+	end
 end
 Workspace.DescendantAdded:Connect(hookUpgradeButton)
 
