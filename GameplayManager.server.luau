@@ -1033,6 +1033,10 @@ local function setupPenUpgradeGui(penInfo: PenInfo)
 	gui.LightInfluence = 0
 	gui.AlwaysOnTop = true
 	gui.Parent = signPart
+	local backGui = gui:Clone()
+	backGui.Name = "PenUpgradeGui_Back"
+	backGui.Face = Enum.NormalId.Back
+	backGui.Parent = signPart
 
 	local frame = Instance.new("Frame")
 	frame.Name = "Panel"
