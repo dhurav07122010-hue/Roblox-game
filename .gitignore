@@ -1,0 +1,12 @@
+# Backups directory (contains large backup copies of .rbxl place files)
+backups/
+
+# Python caches and bytecode
+__pycache__/
+*.py[cod]
+
+# Temporary files and logs
+*.tmp
+*.log
+.DS_Store
+Thumbs.db
