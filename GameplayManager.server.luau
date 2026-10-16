@@ -324,22 +324,42 @@ end
 
 local function updatePenOwnerDisplay(penInfo: PenInfo, owner: Player?)
 	local ownerUserId = owner and owner.UserId or 0
+	local ownerName = owner and owner.Name or ""
+	local penLevel = (owner and _G.PlayerData and _G.PlayerData.getPenUpgradeLevel and _G.PlayerData.getPenUpgradeLevel(owner)) or 0
+	penLevel = math.clamp(tonumber(penLevel) or 0, 0, 5)
+
 	penInfo.Model:SetAttribute("OwnerUserId", ownerUserId)
+	penInfo.Model:SetAttribute("OwnerName", ownerName)
+	penInfo.Model:SetAttribute("PenUpgradeLevel", penLevel)
+	penInfo.Model:SetAttribute("EquippedPetLimit", 6 + penLevel)
 
 	if penInfo.TrainingArea then
 		penInfo.TrainingArea:SetAttribute("OwnerUserId", ownerUserId)
+		penInfo.TrainingArea:SetAttribute("OwnerName", ownerName)
+		penInfo.TrainingArea:SetAttribute("DumbbellTier", penInfo.DumbbellTier or 1)
 	end
 	if penInfo.TrainingPad then
 		penInfo.TrainingPad:SetAttribute("OwnerUserId", ownerUserId)
+		penInfo.TrainingPad:SetAttribute("OwnerName", ownerName)
 	end
 	if penInfo.TrainingDumbbell then
 		penInfo.TrainingDumbbell:SetAttribute("OwnerUserId", ownerUserId)
+		penInfo.TrainingDumbbell:SetAttribute("OwnerName", ownerName)
+		if owner then
+			for _, p in ipairs(penInfo.TrainingDumbbell:GetDescendants()) do
+				if p:IsA("BasePart") then
+					p.Transparency = 0
+				end
+			end
+		end
 	end
 	if penInfo.UpgradeSign then
 		penInfo.UpgradeSign:SetAttribute("OwnerUserId", ownerUserId)
+		penInfo.UpgradeSign:SetAttribute("OwnerName", ownerName)
 		for _, d in ipairs(penInfo.UpgradeSign:GetDescendants()) do
 			if d:IsA("BasePart") then
 				d:SetAttribute("OwnerUserId", ownerUserId)
+				d:SetAttribute("OwnerName", ownerName)
 			end
 		end
 	end
@@ -461,6 +481,8 @@ local function startPlayerTraining(player: Player, penInfo: PenInfo)
 
 	local targetCenter = pad.Position + Vector3.new(0, 2.5, 0)
 	local forward = penInfo.ForwardDir or Vector3.new(0, 0, 1)
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
 	root.CFrame = CFrame.lookAt(targetCenter, targetCenter + forward * 10)
 
 	local session: TrainingSession = {
@@ -500,7 +522,7 @@ local function startPlayerTraining(player: Player, penInfo: PenInfo)
 
 	-- 2. Detect jumping to exit training
 	session.StateConn = hum.StateChanged:Connect(function(_, newState)
-		if newState == Enum.HumanoidStateType.Jumping or newState == Enum.HumanoidStateType.Freefall then
+		if newState == Enum.HumanoidStateType.Jumping then
 			stopPlayerTraining(player, true)
 		end
 	end)
@@ -521,6 +543,23 @@ end)
 
 -- Forward declaration of placeEggFromInventory
 local placeEggFromInventory: (player: Player, penInfo: PenInfo) -> boolean
+
+local function getDumbbellPrototype(protoName: string): Model?
+	local proto = Workspace:FindFirstChild(protoName) or ServerStorage:FindFirstChild(protoName)
+	if not proto then
+		for _, child in ipairs(Workspace:GetChildren()) do
+			if child:IsA("Model") and child.Name:lower() == protoName:lower() then
+				return child
+			end
+		end
+		for _, child in ipairs(ServerStorage:GetChildren()) do
+			if child:IsA("Model") and child.Name:lower() == protoName:lower() then
+				return child
+			end
+		end
+	end
+	return (proto and proto:IsA("Model")) and proto or nil
+end
 
 -- Create the 10x10 stud Strength Training Area in front of each player's pen
 local function setupPenTrainingArea(penInfo: PenInfo)
@@ -560,6 +599,8 @@ local function setupPenTrainingArea(penInfo: PenInfo)
 	local trainingFolder = Instance.new("Model")
 	trainingFolder.Name = "StrengthTrainingArea"
 	trainingFolder:SetAttribute("OwnerUserId", penInfo.Owner and penInfo.Owner.UserId or 0)
+	trainingFolder:SetAttribute("OwnerName", penInfo.Owner and penInfo.Owner.Name or "")
+	trainingFolder:SetAttribute("DumbbellTier", 1)
 	trainingFolder:SetAttribute("IsTraining", false)
 	trainingFolder.Parent = penInfo.Model
 	penInfo.TrainingArea = trainingFolder
@@ -575,6 +616,7 @@ local function setupPenTrainingArea(penInfo: PenInfo)
 	pad.CanCollide = true
 	pad.Transparency = 1 -- Server creates invisible so other players never see it by default
 	pad:SetAttribute("OwnerUserId", penInfo.Owner and penInfo.Owner.UserId or 0)
+	pad:SetAttribute("OwnerName", penInfo.Owner and penInfo.Owner.Name or "")
 	pad.Parent = trainingFolder
 	penInfo.TrainingPad = pad
 
@@ -613,11 +655,12 @@ local function setupPenTrainingArea(penInfo: PenInfo)
 	stroke.Parent = label
 
 	-- Default Dumbbell (Dumbel1 prototype)
-	local dumbel1Prototype = (ServerStorage:FindFirstChild("dumbel1") or Workspace:FindFirstChild("dumbel1")) :: Model?
+	local dumbel1Prototype = getDumbbellPrototype("dumbel1")
 	if dumbel1Prototype and dumbel1Prototype:IsA("Model") then
 		local penDumbbell = dumbel1Prototype:Clone()
 		penDumbbell.Name = "TrainingDumbbell"
 		penDumbbell:SetAttribute("OwnerUserId", penInfo.Owner and penInfo.Owner.UserId or 0)
+		penDumbbell:SetAttribute("OwnerName", penInfo.Owner and penInfo.Owner.Name or "")
 
 		for _, p in ipairs(penDumbbell:GetDescendants()) do
 			if p:IsA("BasePart") then
@@ -868,8 +911,11 @@ local function setupPenTrainingArea(penInfo: PenInfo)
 
 		penInfo.DumbbellTier = tier + 1
 		penInfo.Model:SetAttribute("DumbbellTier", penInfo.DumbbellTier)
+		if penInfo.TrainingArea then
+			penInfo.TrainingArea:SetAttribute("DumbbellTier", penInfo.DumbbellTier)
+		end
 
-		local proto = (ServerStorage:FindFirstChild(nextProtoName) or Workspace:FindFirstChild(nextProtoName)) :: Model?
+		local proto = getDumbbellPrototype(nextProtoName)
 		if proto and proto:IsA("Model") then
 			if penInfo.TrainingDumbbell and penInfo.TrainingDumbbell.Parent then
 				penInfo.TrainingDumbbell:Destroy()
@@ -877,6 +923,7 @@ local function setupPenTrainingArea(penInfo: PenInfo)
 			local newDumbbell = proto:Clone()
 			newDumbbell.Name = "TrainingDumbbell"
 			newDumbbell:SetAttribute("OwnerUserId", penInfo.Owner and penInfo.Owner.UserId or 0)
+			newDumbbell:SetAttribute("OwnerName", penInfo.Owner and penInfo.Owner.Name or "")
 			for _, p in ipairs(newDumbbell:GetDescendants()) do
 				if p:IsA("BasePart") then
 					p.Anchored = true
@@ -1013,86 +1060,102 @@ local function setupPenUpgradeGui(penInfo: PenInfo)
 
 	local signPart: BasePart? = sign.PrimaryPart
 	if not signPart then
-		signPart = sign:FindFirstChildWhichIsA("BasePart", true)
+		local bestArea = 0
+		for _, desc in ipairs(sign:GetDescendants()) do
+			if desc:IsA("BasePart") then
+				local area = desc.Size.X * desc.Size.Y + desc.Size.Y * desc.Size.Z + desc.Size.X * desc.Size.Z
+				if area > bestArea then
+					bestArea = area
+					signPart = desc
+				end
+			end
+		end
 	end
 	if not signPart then
 		warn(string.format("[GameplayManager] Pen %d sign has no BasePart; skipping pen upgrade GUI.", penInfo.Index))
 		return
 	end
 
-	local existingGui = signPart:FindFirstChild("PenUpgradeGui")
-	if existingGui then existingGui:Destroy() end
-	local existingClick = signPart:FindFirstChild("PenUpgradeClickDetector")
-	if existingClick then existingClick:Destroy() end
+	for _, child in ipairs(signPart:GetChildren()) do
+		if child.Name:match("^PenUpgradeGui") or child.Name == "PenUpgradeClickDetector" then
+			child:Destroy()
+		end
+	end
 
-	local gui = Instance.new("SurfaceGui")
-	gui.Name = "PenUpgradeGui"
-	gui.Face = Enum.NormalId.Front
-	gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
-	gui.PixelsPerStud = 32
-	gui.LightInfluence = 0
-	gui.AlwaysOnTop = true
-	gui.Parent = signPart
-	local backGui = gui:Clone()
-	backGui.Name = "PenUpgradeGui_Back"
-	backGui.Face = Enum.NormalId.Back
-	backGui.Parent = signPart
+	local levelLabels: { TextLabel } = {}
+	local actionLabels: { TextLabel } = {}
 
-	local frame = Instance.new("Frame")
-	frame.Name = "Panel"
-	frame.Size = UDim2.fromScale(1, 1)
-	frame.BackgroundColor3 = Color3.fromRGB(25, 29, 40)
-	frame.BorderSizePixel = 0
-	frame.Parent = gui
-	local stroke = Instance.new("UIStroke")
-	stroke.Color = Color3.fromRGB(255, 195, 0)
-	stroke.Thickness = 3
-	stroke.Parent = frame
+	local function createGuiOnFace(face: Enum.NormalId, suffix: string)
+		local gui = Instance.new("SurfaceGui")
+		gui.Name = "PenUpgradeGui_" .. suffix
+		gui.Face = face
+		gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+		gui.PixelsPerStud = 32
+		gui.LightInfluence = 0
+		gui.AlwaysOnTop = true
+		gui.Parent = signPart
 
-	local title = Instance.new("TextLabel")
-	title.Name = "Title"
-	title.Size = UDim2.new(1, -8, 0.28, 0)
-	title.Position = UDim2.new(0, 4, 0.02, 0)
-	title.BackgroundTransparency = 1
-	title.Font = Enum.Font.FredokaOne
-	title.TextScaled = true
-	title.TextColor3 = Color3.fromRGB(255, 205, 55)
-	title.Text = "PEN UPGRADE"
-	title.Parent = frame
+		local frame = Instance.new("Frame")
+		frame.Name = "Panel"
+		frame.Size = UDim2.fromScale(1, 1)
+		frame.BackgroundColor3 = Color3.fromRGB(25, 29, 40)
+		frame.BorderSizePixel = 0
+		frame.Parent = gui
+		local stroke = Instance.new("UIStroke")
+		stroke.Color = Color3.fromRGB(255, 195, 0)
+		stroke.Thickness = 3
+		stroke.Parent = frame
 
-	local levelLabel = Instance.new("TextLabel")
-	levelLabel.Name = "Level"
-	levelLabel.Size = UDim2.new(1, -8, 0.25, 0)
-	levelLabel.Position = UDim2.new(0, 4, 0.30, 0)
-	levelLabel.BackgroundTransparency = 1
-	levelLabel.Font = Enum.Font.FredokaOne
-	levelLabel.TextScaled = true
-	levelLabel.TextColor3 = Color3.new(1, 1, 1)
-	levelLabel.Parent = frame
+		local title = Instance.new("TextLabel")
+		title.Name = "Title"
+		title.Size = UDim2.new(1, -8, 0.28, 0)
+		title.Position = UDim2.new(0, 4, 0.02, 0)
+		title.BackgroundTransparency = 1
+		title.Font = Enum.Font.FredokaOne
+		title.TextScaled = true
+		title.TextColor3 = Color3.fromRGB(255, 205, 55)
+		title.Text = "PEN UPGRADE"
+		title.Parent = frame
 
-	local actionLabel = Instance.new("TextLabel")
-	actionLabel.Name = "Action"
-	actionLabel.Size = UDim2.new(1, -8, 0.34, 0)
-	actionLabel.Position = UDim2.new(0, 4, 0.57, 0)
-	actionLabel.BackgroundColor3 = Color3.fromRGB(46, 180, 92)
-	actionLabel.Font = Enum.Font.FredokaOne
-	actionLabel.TextScaled = true
-	actionLabel.TextColor3 = Color3.new(1, 1, 1)
-	actionLabel.Parent = frame
-	local actionCorner = Instance.new("UICorner")
-	actionCorner.CornerRadius = UDim.new(0, 6)
-	actionCorner.Parent = actionLabel
+		local levelLabel = Instance.new("TextLabel")
+		levelLabel.Name = "Level"
+		levelLabel.Size = UDim2.new(1, -8, 0.25, 0)
+		levelLabel.Position = UDim2.new(0, 4, 0.30, 0)
+		levelLabel.BackgroundTransparency = 1
+		levelLabel.Font = Enum.Font.FredokaOne
+		levelLabel.TextScaled = true
+		levelLabel.TextColor3 = Color3.new(1, 1, 1)
+		levelLabel.Parent = frame
+		table.insert(levelLabels, levelLabel)
 
-	local hint = Instance.new("TextLabel")
-	hint.Name = "Hint"
-	hint.Size = UDim2.new(1, -8, 0.10, 0)
-	hint.Position = UDim2.new(0, 4, 0.90, 0)
-	hint.BackgroundTransparency = 1
-	hint.Font = Enum.Font.GothamBold
-	hint.TextScaled = true
-	hint.TextColor3 = Color3.fromRGB(210, 210, 210)
-	hint.Text = "CLICK SIGN TO UPGRADE"
-	hint.Parent = frame
+		local actionLabel = Instance.new("TextLabel")
+		actionLabel.Name = "Action"
+		actionLabel.Size = UDim2.new(1, -8, 0.34, 0)
+		actionLabel.Position = UDim2.new(0, 4, 0.57, 0)
+		actionLabel.BackgroundColor3 = Color3.fromRGB(46, 180, 92)
+		actionLabel.Font = Enum.Font.FredokaOne
+		actionLabel.TextScaled = true
+		actionLabel.TextColor3 = Color3.new(1, 1, 1)
+		actionLabel.Parent = frame
+		local actionCorner = Instance.new("UICorner")
+		actionCorner.CornerRadius = UDim.new(0, 6)
+		actionCorner.Parent = actionLabel
+		table.insert(actionLabels, actionLabel)
+
+		local hint = Instance.new("TextLabel")
+		hint.Name = "Hint"
+		hint.Size = UDim2.new(1, -8, 0.10, 0)
+		hint.Position = UDim2.new(0, 4, 0.90, 0)
+		hint.BackgroundTransparency = 1
+		hint.Font = Enum.Font.GothamBold
+		hint.TextScaled = true
+		hint.TextColor3 = Color3.fromRGB(210, 210, 210)
+		hint.Text = "CLICK SIGN TO UPGRADE"
+		hint.Parent = frame
+	end
+
+	createGuiOnFace(Enum.NormalId.Front, "Front")
+	createGuiOnFace(Enum.NormalId.Back, "Back")
 
 	local click = Instance.new("ClickDetector")
 	click.Name = "PenUpgradeClickDetector"
@@ -1101,19 +1164,32 @@ local function setupPenUpgradeGui(penInfo: PenInfo)
 
 	local function refresh()
 		local level = (_G.PlayerData and _G.PlayerData.getPenUpgradeLevel and penInfo.Owner)
-			and _G.PlayerData.getPenUpgradeLevel(penInfo.Owner) or 0
+			and _G.PlayerData.getPenUpgradeLevel(penInfo.Owner) or (penInfo.Model:GetAttribute("PenUpgradeLevel") or 0)
 		level = math.clamp(tonumber(level) or 0, 0, 5)
+
+		local levelText: string
 		if penInfo.Owner then
-			levelLabel.Text = string.format("LEVEL %d  •  PET LIMIT %d", level, 6 + level)
+			levelText = string.format("LEVEL %d  •  PET LIMIT %d", level, 6 + level)
 		else
-			levelLabel.Text = "UNCLAIMED PEN"
+			levelText = "UNCLAIMED PEN"
 		end
+
+		local actionText: string
+		local actionColor: Color3
 		if level >= 5 then
-			actionLabel.Text = "MAX LEVEL"
-			actionLabel.BackgroundColor3 = Color3.fromRGB(90, 100, 115)
+			actionText = "MAX LEVEL"
+			actionColor = Color3.fromRGB(90, 100, 115)
 		else
-			actionLabel.Text = string.format("UPGRADE  $%s", tostring(PEN_UPGRADE_COSTS[level + 1]))
-			actionLabel.BackgroundColor3 = Color3.fromRGB(46, 180, 92)
+			actionText = string.format("UPGRADE  $%d", PEN_UPGRADE_COSTS[level + 1])
+			actionColor = Color3.fromRGB(46, 180, 92)
+		end
+
+		for _, lbl in ipairs(levelLabels) do
+			lbl.Text = levelText
+		end
+		for _, act in ipairs(actionLabels) do
+			act.Text = actionText
+			act.BackgroundColor3 = actionColor
 		end
 	end
 
@@ -1123,8 +1199,9 @@ local function setupPenUpgradeGui(penInfo: PenInfo)
 			return
 		end
 		local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart") :: BasePart?
-		if not root or (root.Position - signPart.Position).Magnitude > 20 then return end
-		local level = _G.PlayerData and _G.PlayerData.getPenUpgradeLevel and _G.PlayerData.getPenUpgradeLevel(player) or 0
+		if not root or (root.Position - signPart.Position).Magnitude > 25 then return end
+		local level = (_G.PlayerData and _G.PlayerData.getPenUpgradeLevel and _G.PlayerData.getPenUpgradeLevel(player))
+			or (penInfo.Model:GetAttribute("PenUpgradeLevel") or 0)
 		level = math.clamp(tonumber(level) or 0, 0, 5)
 		if level >= 5 then
 			showFloatingFeedback(signPart.Position, "Pen is already at maximum level!", Color3.fromRGB(255, 205, 55))
@@ -1140,15 +1217,16 @@ local function setupPenUpgradeGui(penInfo: PenInfo)
 			return
 		end
 		if not _G.PlayerData.deductMoney(player, cost) then return end
-		if not _G.PlayerData.setPenUpgradeLevel(player, level + 1) then
+		local newLevel = level + 1
+		if not _G.PlayerData.setPenUpgradeLevel(player, newLevel) then
 			_G.PlayerData.addMoney(player, cost)
 			return
 		end
-		penInfo.Model:SetAttribute("PenUpgradeLevel", level + 1)
-		penInfo.Model:SetAttribute("EquippedPetLimit", 6 + level + 1)
+		penInfo.Model:SetAttribute("PenUpgradeLevel", newLevel)
+		penInfo.Model:SetAttribute("EquippedPetLimit", 6 + newLevel)
 		refresh()
 		showFloatingFeedback(signPart.Position + Vector3.new(0, 2, 0),
-			string.format("PEN UPGRADED! Level %d • Pet limit %d", level + 1, 7 + level),
+			string.format("PEN UPGRADED! Level %d • Pet limit %d", newLevel, 6 + newLevel),
 			Color3.fromRGB(80, 255, 120))
 	end
 
@@ -1209,14 +1287,8 @@ local function discoverPens()
 
 	print(string.format("[GameplayManager] Discovered %d real pens in Workspace.Spawn.Pens", #pensList))
 
-	-- Secure prototype dumbbells in ServerStorage so they do not show loose in Workspace
-	for _, name in ipairs({"dumbel1", "dumbel2", "dumbel3", "Dumbel1", "Dumbel2", "Dumbel3"}) do
-		local proto = Workspace:FindFirstChild(name)
-		if proto and proto:IsA("Model") then
-			proto.Parent = ServerStorage
-			print(string.format("[GameplayManager] Moved prototype '%s' to ServerStorage", name))
-		end
-	end
+	-- Existing dumbel1, dumbel2, dumbel3 models remain safe and untouched in Workspace.
+	-- Visual prototype hiding is handled client-side by StatsHUDController.
 
 	-- Set up overhead display, training area and containment barriers for each real pen
 	for _, p in ipairs(pensList) do
@@ -1295,6 +1367,11 @@ local function assignPenToPlayer(player: Player): PenInfo?
 			pen.Owner = player
 			playerPenMap[player] = pen
 			updatePenOwnerDisplay(pen, player)
+			player:GetAttributeChangedSignal("PenUpgradeLevel"):Connect(function()
+				if pen.Owner == player then
+					updatePenOwnerDisplay(pen, player)
+				end
+			end)
 			print(string.format("[GameplayManager] Assigned Pen %d to player %s", pen.Index, player.Name))
 			return pen
 		end
@@ -1902,17 +1979,18 @@ local function releasePlayerPen(player: Player)
 		if pen.UpdateSignDisplay then
 			pen.UpdateSignDisplay()
 		end
-		local dumbel1Prototype = (ServerStorage:FindFirstChild("dumbel1") or Workspace:FindFirstChild("dumbel1")) :: Model?
+		local dumbel1Prototype = getDumbbellPrototype("dumbel1")
 		if dumbel1Prototype and pen.TrainingArea and pen.TrainingDumbbell and pen.TrainingPad then
 			pen.TrainingDumbbell:Destroy()
 			local penDumbbell = dumbel1Prototype:Clone()
 			penDumbbell.Name = "TrainingDumbbell"
 			penDumbbell:SetAttribute("OwnerUserId", 0)
+			penDumbbell:SetAttribute("OwnerName", "")
 			for _, p in ipairs(penDumbbell:GetDescendants()) do
 				if p:IsA("BasePart") then
 					p.Anchored = true
 					p.CanCollide = false
-					p.Transparency = 1
+					p.Transparency = 0
 				end
 			end
 			penDumbbell:PivotTo(CFrame.new(pen.TrainingPad.Position.X, pen.TrainingPad.Position.Y + 0.4, pen.TrainingPad.Position.Z))
@@ -2014,6 +2092,29 @@ local function hatchSlot(penInfo: PenInfo, slotIndex: number)
 
 	local owner = penInfo.Owner
 	if not owner then return end
+
+	local maxPets = (_G.PlayerData and _G.PlayerData.getEquippedPetLimit and _G.PlayerData.getEquippedPetLimit(owner))
+		or (penInfo.Model:GetAttribute("EquippedPetLimit") or 6)
+
+	local currentPets = 0
+	for _, s in pairs(penInfo.Slots) do
+		if s and s.Type == "Pet" and s.Model and s.Model.Parent then
+			currentPets += 1
+		end
+	end
+
+	if currentPets >= maxPets then
+		local slotCFrame = calculateSlotCFrame(penInfo.EggArea, slotIndex)
+		showFloatingFeedback(slotCFrame.Position + Vector3.new(0, 2, 0),
+			string.format("Pet limit reached (%d/%d)! Upgrade pen to hatch more pets.", currentPets, maxPets),
+			Color3.fromRGB(255, 120, 80))
+		task.delay(3, function()
+			if penInfo.Slots[slotIndex] and penInfo.Slots[slotIndex].Type == "Egg" then
+				hatchSlot(penInfo, slotIndex)
+			end
+		end)
+		return
+	end
 
 	local slotCFrame = calculateSlotCFrame(penInfo.EggArea, slotIndex)
 	local eggModel = slot.Model
@@ -2530,7 +2631,8 @@ spawnZone1Eggs = function()
 			end
 			local zoneName = zoneContainer and zoneContainer.Name or "Zone1"
 			local barrier: BasePart? = nil
-			local barrierInstance = zoneContainer and zoneContainer:FindFirstChild("NightBarrier", true)
+			local barrierInstance = (zoneContainer and zoneContainer:FindFirstChild("NightBarrier", true))
+				or Workspace:FindFirstChild("NightBarrier", true)
 			if barrierInstance and barrierInstance:IsA("BasePart") then
 				barrier = barrierInstance
 			end
@@ -2579,8 +2681,9 @@ spawnZone1Eggs = function()
 		-- Fallback to Zone1 floor
 		local zones = Workspace:FindFirstChild("Zones")
 		local zone1 = zones and zones:FindFirstChild("Zone1") or Workspace:FindFirstChild("Zone1")
-		local zoneArea = zone1 and zone1:FindFirstChild("ZoneArea") :: BasePart?
-		local barrier = zone1 and zone1:FindFirstChild("NightBarrier") :: BasePart?
+		local zoneArea = zone1 and (zone1:FindFirstChild("ZoneArea", true) or zone1:FindFirstChild("Area", true)) :: BasePart?
+		local barrier = (zone1 and zone1:FindFirstChild("NightBarrier", true))
+			or (Workspace:FindFirstChild("NightBarrier", true)) :: BasePart?
 		if not zoneArea then return end
 
 		local targetCount = GameplayConfig.Eggs.Zone1SpawnCount or 15

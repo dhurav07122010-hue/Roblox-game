@@ -495,8 +495,10 @@ local saveInProgress: { [Player]: boolean } = {}
 local function savePlayerData(player: Player): boolean
 	-- Serialize writes per player so autosave, leave, and shutdown cannot
 	-- complete out of order and overwrite a newer snapshot with an older one.
-	while saveInProgress[player] do
+	local waitElapsed = 0
+	while saveInProgress[player] and waitElapsed < 10 do
 		task.wait(0.1)
+		waitElapsed += 0.1
 	end
 
 	local d = data[player]
@@ -563,6 +565,8 @@ local function onPlayerAdded(player: Player)
 
 	local tierConfig = ShopConfig.SpeedTiers[data[player].SpeedTier]
 	player:SetAttribute("BaseSpeed", tierConfig and tierConfig.WalkSpeed or 16)
+	player:SetAttribute("PenUpgradeLevel", data[player].PenUpgradeLevel or 0)
+	player:SetAttribute("EquippedPetLimit", 6 + math.clamp(data[player].PenUpgradeLevel or 0, 0, 5))
 
 	player.CharacterAdded:Connect(function(character)
 		task.defer(function()
@@ -598,8 +602,18 @@ end
 Players.PlayerRemoving:Connect(onPlayerRemoving)
 
 game:BindToClose(function()
+	local activeSaves = 0
 	for p, _ in pairs(data) do
-		savePlayerData(p)
+		activeSaves += 1
+		task.spawn(function()
+			pcall(savePlayerData, p)
+			activeSaves -= 1
+		end)
+	end
+	local elapsed = 0
+	while activeSaves > 0 and elapsed < 25 do
+		task.wait(0.1)
+		elapsed += 0.1
 	end
 end)
 
@@ -690,6 +704,8 @@ _G.PlayerData = {
 		local d = data[player]
 		if not d then return false end
 		d.PenUpgradeLevel = math.clamp(math.floor(level), 0, 5)
+		player:SetAttribute("PenUpgradeLevel", d.PenUpgradeLevel)
+		player:SetAttribute("EquippedPetLimit", 6 + d.PenUpgradeLevel)
 		return true
 	end,
 	getEquippedPetLimit = function(player: Player): number

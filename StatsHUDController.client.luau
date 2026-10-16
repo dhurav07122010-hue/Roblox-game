@@ -273,7 +273,8 @@ local function updatePenTrainingVisibility(pen: Model)
 
 	local myUserId = player.UserId
 	local ownerId = pen:GetAttribute("OwnerUserId") or 0
-	local isOwner = (myUserId ~= 0 and ownerId ~= 0 and ownerId == myUserId)
+	local ownerName = pen:GetAttribute("OwnerName") or ""
+	local isOwner = (myUserId ~= 0 and ownerId ~= 0 and ownerId == myUserId) or (ownerName ~= "" and ownerName == player.Name)
 	local isBeingUsed = (pen:GetAttribute("IsTraining") == true)
 	local shouldBeVisible = isOwner or isBeingUsed
 
@@ -321,33 +322,47 @@ local function hookPen(pen: Model)
 	pen:GetAttributeChangedSignal("OwnerUserId"):Connect(function()
 		updatePenTrainingVisibility(pen)
 	end)
+	pen:GetAttributeChangedSignal("OwnerName"):Connect(function()
+		updatePenTrainingVisibility(pen)
+	end)
 	pen:GetAttributeChangedSignal("IsTraining"):Connect(function()
 		updatePenTrainingVisibility(pen)
 	end)
+	pen:GetAttributeChangedSignal("DumbbellTier"):Connect(function()
+		task.defer(function()
+			rebuildPenTrainingCache(pen)
+		end)
+	end)
+
+	local function hookTrainingArea(ta: Instance)
+		ta.DescendantAdded:Connect(function()
+			task.defer(function()
+				rebuildPenTrainingCache(pen)
+			end)
+		end)
+		ta.DescendantRemoving:Connect(function()
+			task.defer(function()
+				rebuildPenTrainingCache(pen)
+			end)
+		end)
+	end
+
+	local currentArea = pen:FindFirstChild("StrengthTrainingArea")
+	if currentArea then
+		hookTrainingArea(currentArea)
+	end
 
 	pen.ChildAdded:Connect(function(child)
 		if child.Name == "StrengthTrainingArea" or child.Name == "TrainingPad"
 			or child.Name == "TrainingDumbbell" or child.Name == "TrainingUpgradeSign" then
+			if child.Name == "StrengthTrainingArea" then
+				hookTrainingArea(child)
+			end
 			task.defer(function()
 				rebuildPenTrainingCache(pen)
 			end)
 		end
 	end)
-
-	local trainingArea = pen:FindFirstChild("StrengthTrainingArea")
-	if trainingArea then
-		trainingArea.DescendantAdded:Connect(function(desc)
-			local cache = penTrainingCache[pen]
-			if cache and not table.find(cache.items, desc) then
-				table.insert(cache.items, desc)
-				local myUserId = player.UserId
-				local ownerId = pen:GetAttribute("OwnerUserId") or 0
-				local isOwner = (myUserId ~= 0 and ownerId ~= 0 and ownerId == myUserId)
-				local isBeingUsed = (pen:GetAttribute("IsTraining") == true)
-				applyItemVisibility(desc, isOwner or isBeingUsed, isOwner)
-			end
-		end)
-	end
 end
 
 local function hideLooseDumbbell(model: Instance)
@@ -387,15 +402,22 @@ task.spawn(function()
 		hookPen(pen)
 	end
 
-	local spawnFolder = Workspace:FindFirstChild("Spawn")
-	local pensFolder = spawnFolder and spawnFolder:FindFirstChild("Pens")
-	if pensFolder then
-		pensFolder.ChildAdded:Connect(function(child)
-			if child:IsA("Model") then
-				hookPen(child)
+	task.spawn(function()
+		local spawnFolder = Workspace:WaitForChild("Spawn", 8)
+		local pensFolder = spawnFolder and spawnFolder:WaitForChild("Pens", 8)
+		if pensFolder then
+			for _, child in ipairs(pensFolder:GetChildren()) do
+				if child:IsA("Model") then
+					hookPen(child)
+				end
 			end
-		end)
-	end
+			pensFolder.ChildAdded:Connect(function(child)
+				if child:IsA("Model") then
+					hookPen(child)
+				end
+			end)
+		end
+	end)
 end)
 
 --------------------------------------------------------------------------------
