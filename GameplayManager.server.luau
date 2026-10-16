@@ -1107,13 +1107,23 @@ end
 local function clearPenContents(penInfo: PenInfo)
 	for slotIdx, slot in pairs(penInfo.Slots) do
 		if slot.HatchThread then
-			task.cancel(slot.HatchThread)
+			pcall(task.cancel, slot.HatchThread)
 		end
 		if slot.Model and slot.Model.Parent then
 			slot.Model:Destroy()
 		end
 	end
 	penInfo.Slots = {}
+
+	-- Sweep any orphaned placed eggs or pets inside the pen model
+	if penInfo.Model then
+		for _, child in ipairs(penInfo.Model:GetChildren()) do
+			local nameL = child.Name:lower()
+			if nameL:match("^placedegg") or nameL:match("^lee_") or nameL:match("^rocklee") then
+				child:Destroy()
+			end
+		end
+	end
 end
 
 local function assignPenToPlayer(player: Player): PenInfo?
@@ -1691,10 +1701,29 @@ pickUpEgg = function(player: Player, worldEgg: Model)
 		end
 	end)
 
-	-- Respawn replacement world egg after 15s during Day
+	-- Respawn replacement world egg after 15s during Day (only if below total capacity)
 	task.delay(15, function()
 		if Lighting:GetAttribute("Phase") == "DAY" then
-			spawnZone1Eggs()
+			worldEggsFolder = getOrCreateWorldEggsFolder()
+			local eggSpawns = findEggSpawnParts()
+			local maxAllowed = (#eggSpawns > 0 and (#eggSpawns * (GameplayConfig.Eggs.EggsPerSpawn or 10))) or (GameplayConfig.Eggs.Zone1SpawnCount or 15)
+			if #worldEggsFolder:GetChildren() < maxAllowed then
+				local tierKey, tierData = pickRandomEggTier()
+				local scale = tierData.Scale or 1.0
+				local targetCF = homeSpawnCF
+				if not targetCF and #eggSpawns > 0 then
+					local baseExtents = getEggExtents()
+					targetCF = getSpawnCFrameOnEggSpawn(eggSpawns[math.random(1, #eggSpawns)], baseExtents * scale)
+				end
+				if targetCF then
+					spawnSingleWorldEgg(sourceZone or "Zone1", targetCF, {
+						SizeTier = tierKey,
+						Scale = scale,
+						Name = tierData.Name,
+						SpeedMultiplier = tierData.SpeedMultiplier,
+					})
+				end
+			end
 		end
 	end)
 end
@@ -1801,7 +1830,19 @@ local function startLeeWanderingAI(lee: Model, penInfo: PenInfo)
 			humanoid.WalkSpeed = GameplayConfig.Pets.Lee.WalkSpeed
 			humanoid:MoveTo(targetPos)
 
-			humanoid.MoveToFinished:Wait()
+			-- Wait for move to finish with a safe 5-second timeout
+			local moveDone = false
+			local conn: RBXScriptConnection?
+			conn = humanoid.MoveToFinished:Connect(function()
+				moveDone = true
+			end)
+			local elapsed = 0
+			while not moveDone and elapsed < 5 do
+				if not lee.Parent or not penInfo.Owner or humanoid.Health <= 0 then break end
+				task.wait(0.2)
+				elapsed += 0.2
+			end
+			if conn then conn:Disconnect() end
 		end
 	end)
 end
@@ -2311,20 +2352,26 @@ end
 
 spawnZone1Eggs = function()
 	worldEggsFolder = getOrCreateWorldEggsFolder()
-	worldEggsFolder:ClearAllChildren()
 
 	local baseExtents = getEggExtents()
 	local eggSpawnParts = findEggSpawnParts()
 
 	if #eggSpawnParts > 0 then
-		print(string.format("[GameplayManager] Spawning eggs on %d zone 'egg spawn' parts...", #eggSpawnParts))
 		local eggsPerSpawn = GameplayConfig.Eggs.EggsPerSpawn or 10
 
 		for _, spawnPart in ipairs(eggSpawnParts) do
 			local zoneParent = spawnPart:FindFirstAncestorWhichIsA("Model")
 			local zoneName = (zoneParent and zoneParent.Name) or "Zone1"
 
-			for _ = 1, eggsPerSpawn do
+			local existingCount = 0
+			for _, egg in ipairs(worldEggsFolder:GetChildren()) do
+				if (egg:GetPivot().Position - spawnPart.Position).Magnitude < math.max(spawnPart.Size.Magnitude, 15) then
+					existingCount += 1
+				end
+			end
+
+			local needed = math.max(0, eggsPerSpawn - existingCount)
+			for _ = 1, needed do
 				local tierKey, tierData = pickRandomEggTier()
 				local scale = tierData.Scale or 1.0
 				local eggExtents = baseExtents * scale
@@ -2347,7 +2394,10 @@ spawnZone1Eggs = function()
 		if not zoneArea then return end
 
 		local targetCount = GameplayConfig.Eggs.Zone1SpawnCount or 15
-		for _ = 1, targetCount do
+		local currentCount = #worldEggsFolder:GetChildren()
+		local needed = math.max(0, targetCount - currentCount)
+
+		for _ = 1, needed do
 			local tierKey, tierData = pickRandomEggTier()
 			local scale = tierData.Scale or 1.0
 			local eggExtents = baseExtents * scale
@@ -2383,9 +2433,13 @@ local function startIncomeTicker()
 			for player, pen in pairs(playerPenMap) do
 				if player and player.Parent and pen then
 					local leeCount = 0
-					for _, slot in pairs(pen.Slots) do
-						if slot and slot.Type == "Pet" and slot.Model and slot.Model.Parent then
-							leeCount += 1
+					for slotIdx, slot in pairs(pen.Slots) do
+						if slot and slot.Type == "Pet" then
+							if slot.Model and slot.Model.Parent then
+								leeCount += 1
+							else
+								pen.Slots[slotIdx] = nil
+							end
 						end
 					end
 
