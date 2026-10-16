@@ -338,6 +338,139 @@ local function setupLeaderstats(player: Player): (IntValue, IntValue)
 end
 
 --------------------------------------------------
+-- EGG INVENTORY PERSISTENCE & TOOL RESTORATION
+--------------------------------------------------
+
+-- Create physical egg Tool for Backpack
+local function createEggTool(eggData: any): Tool
+	local tool = Instance.new("Tool")
+	tool.Name = eggData.Name or "Anime Egg"
+	tool.CanBeDropped = false
+	tool.RequiresHandle = true
+	tool:SetAttribute("IsAnimeEgg", true)
+	tool:SetAttribute("SizeTier", eggData.SizeTier or "Small")
+	tool:SetAttribute("Scale", tonumber(eggData.Scale) or 1.0)
+	tool:SetAttribute("TierName", eggData.Name or "Anime Egg")
+
+	local handle = Instance.new("Part")
+	handle.Name = "Handle"
+	handle.Size = Vector3.new(1.2, 1.6, 1.2)
+	handle.Transparency = 1
+	handle.CanCollide = false
+	handle.Massless = true
+	handle.Parent = tool
+
+	local whiteModel = Workspace:FindFirstChild("egg") and Workspace.egg:FindFirstChild("white")
+	if whiteModel then
+		local eggVisual = whiteModel:Clone()
+		eggVisual.Name = "EggVisual"
+		pcall(function()
+			eggVisual:ScaleTo(0.55 * (tonumber(eggData.Scale) or 1.0))
+		end)
+		for _, p in ipairs(eggVisual:GetDescendants()) do
+			if p:IsA("BasePart") then
+				p.CanCollide = false
+				p.CanTouch = false
+				p.CanQuery = false
+				p.Anchored = false
+				p.Massless = true
+				local w = Instance.new("WeldConstraint")
+				w.Part0 = handle
+				w.Part1 = p
+				w.Parent = p
+			end
+		end
+		eggVisual:PivotTo(handle.CFrame)
+		eggVisual.Parent = tool
+	else
+		local mesh = Instance.new("SpecialMesh")
+		mesh.MeshType = Enum.MeshType.Sphere
+		mesh.Scale = Vector3.new(1.2, 1.6, 1.2)
+		mesh.Parent = handle
+		handle.Transparency = 0
+		handle.Color = Color3.fromRGB(250, 245, 235)
+	end
+
+	return tool
+end
+
+-- Safely restore egg tools into Backpack without creating any duplicates
+local function restoreEggTools(player: Player)
+	local d = data[player]
+	if not d or type(d.EggInventory) ~= "table" then return end
+	local backpack = player:FindFirstChild("Backpack") or player:WaitForChild("Backpack", 4)
+	if not backpack then return end
+
+	-- Find all existing egg tools currently in Backpack or equipped in Character
+	local existingTools: { Tool } = {}
+	for _, item in ipairs(backpack:GetChildren()) do
+		if item:IsA("Tool") and item:GetAttribute("IsAnimeEgg") == true then
+			table.insert(existingTools, item)
+		end
+	end
+	if player.Character then
+		for _, item in ipairs(player.Character:GetChildren()) do
+			if item:IsA("Tool") and item:GetAttribute("IsAnimeEgg") == true then
+				table.insert(existingTools, item)
+			end
+		end
+	end
+
+	-- Only create tools if the player is missing them
+	if #existingTools < #d.EggInventory then
+		for i = #existingTools + 1, #d.EggInventory do
+			local eggData = d.EggInventory[i]
+			if eggData then
+				local tool = createEggTool(eggData)
+				tool.Parent = backpack
+			end
+		end
+	elseif #existingTools > #d.EggInventory then
+		-- If there are excess duplicate tools, clean them up
+		for i = #d.EggInventory + 1, #existingTools do
+			existingTools[i]:Destroy()
+		end
+	end
+
+	player:SetAttribute("EggCount", #d.EggInventory)
+end
+
+-- Gather current egg inventory from held tools or fallback to memory
+local function serializeEggInventory(player: Player): { any }
+	local d = data[player]
+	local eggs = {}
+	local foundTools = false
+
+	local containers = { player:FindFirstChild("Backpack"), player.Character }
+	for _, container in ipairs(containers) do
+		if container then
+			for _, item in ipairs(container:GetChildren()) do
+				if item:IsA("Tool") and item:GetAttribute("IsAnimeEgg") == true then
+					foundTools = true
+					table.insert(eggs, {
+						SizeTier = item:GetAttribute("SizeTier") or "Small",
+						Scale = tonumber(item:GetAttribute("Scale")) or 1.0,
+						Name = tostring(item:GetAttribute("TierName") or item.Name or "Anime Egg"),
+					})
+				end
+			end
+		end
+	end
+
+	if not foundTools and d and type(d.EggInventory) == "table" then
+		for _, e in ipairs(d.EggInventory) do
+			table.insert(eggs, {
+				SizeTier = tostring(e.SizeTier or "Small"),
+				Scale = tonumber(e.Scale) or 1.0,
+				Name = tostring(e.Name or "Anime Egg"),
+			})
+		end
+	end
+
+	return eggs
+end
+
+--------------------------------------------------
 -- PLAYER LIFECYCLE
 --------------------------------------------------
 
@@ -358,12 +491,15 @@ local function onPlayerAdded(player: Player)
 	strength.Value = data[player].Strength
 	money.Value = data[player].Money
 	player:SetAttribute("EggCount", #data[player].EggInventory)
-	player:SetAttribute("BaseSpeed", 16)
+
+	local tierConfig = ShopConfig.SpeedTiers[data[player].SpeedTier]
+	player:SetAttribute("BaseSpeed", tierConfig and tierConfig.WalkSpeed or 16)
 
 	player.CharacterAdded:Connect(function(character)
 		task.defer(function()
 			applyWalkSpeed(player)
 			applyTrail(player)
+			restoreEggTools(player)
 		end)
 	end)
 
@@ -371,6 +507,11 @@ local function onPlayerAdded(player: Player)
 		task.defer(function()
 			applyWalkSpeed(player)
 			applyTrail(player)
+			restoreEggTools(player)
+		end)
+	else
+		task.defer(function()
+			restoreEggTools(player)
 		end)
 	end
 end
@@ -385,6 +526,7 @@ local function onPlayerRemoving(player: Player)
 	if d then
 		local arr = {}
 		for id in pairs(d.OwnedTrails) do table.insert(arr, id) end
+		local eggList = serializeEggInventory(player)
 		saveData(player.UserId, {
 			Strength = d.Strength,
 			Money = d.Money,
@@ -392,6 +534,7 @@ local function onPlayerRemoving(player: Player)
 			SpeedTier = d.SpeedTier,
 			Trail = d.Trail,
 			OwnedTrails = arr,
+			EggInventory = eggList,
 		})
 	end
 	data[player] = nil
@@ -402,6 +545,7 @@ game:BindToClose(function()
 	for p, d in pairs(data) do
 		local arr = {}
 		for id in pairs(d.OwnedTrails) do table.insert(arr, id) end
+		local eggList = serializeEggInventory(p)
 		saveData(p.UserId, {
 			Strength = d.Strength,
 			Money = d.Money,
@@ -409,6 +553,7 @@ game:BindToClose(function()
 			SpeedTier = d.SpeedTier,
 			Trail = d.Trail,
 			OwnedTrails = arr,
+			EggInventory = eggList,
 		})
 	end
 end)
@@ -524,13 +669,26 @@ _G.PlayerData = {
 		player:SetAttribute("EggCount", #d.EggInventory)
 		return true
 	end,
-	removeEggFromInventory = function(player: Player, index: number?): any
+	removeEggFromInventory = function(player: Player, target: any?): any
 		local d = data[player]
 		if not d or type(d.EggInventory) ~= "table" or #d.EggInventory == 0 then
 			return nil
 		end
-		local idx = index or #d.EggInventory
-		local egg = table.remove(d.EggInventory, idx)
+		local removeIdx = nil
+		if type(target) == "number" then
+			removeIdx = math.clamp(target, 1, #d.EggInventory)
+		elseif type(target) == "table" and target.Name then
+			for i, egg in ipairs(d.EggInventory) do
+				if egg.Name == target.Name and (not target.SizeTier or egg.SizeTier == target.SizeTier) then
+					removeIdx = i
+					break
+				end
+			end
+		end
+		if not removeIdx then
+			removeIdx = #d.EggInventory
+		end
+		local egg = table.remove(d.EggInventory, removeIdx)
 		player:SetAttribute("EggCount", #d.EggInventory)
 		return egg
 	end,
@@ -538,6 +696,8 @@ _G.PlayerData = {
 		local d = data[player]
 		return (d and type(d.EggInventory) == "table") and #d.EggInventory or 0
 	end,
+	createEggTool = createEggTool,
+	restoreEggTools = restoreEggTools,
 }
 
 print("[PlayerData] Initialized with Strength, Money, Speed, and Pen Level systems active.")

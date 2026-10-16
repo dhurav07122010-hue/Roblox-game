@@ -1305,6 +1305,7 @@ local function giveEggTool(player: Player, eggData: { SizeTier: string, Scale: n
 	tool:SetAttribute("SizeTier", eggData.SizeTier)
 	tool:SetAttribute("Scale", eggData.Scale)
 	tool:SetAttribute("TierName", eggData.Name)
+	tool:SetAttribute("ActivatedHooked", true)
 
 	local handle = Instance.new("Part")
 	handle.Name = "Handle"
@@ -1377,7 +1378,7 @@ local function giveEggTool(player: Player, eggData: { SizeTier: string, Scale: n
 		if placed then
 			tool:Destroy()
 			if _G.PlayerData and _G.PlayerData.removeEggFromInventory then
-				_G.PlayerData.removeEggFromInventory(player)
+				_G.PlayerData.removeEggFromInventory(player, eggData)
 			end
 		end
 	end)
@@ -2297,13 +2298,63 @@ Lighting:GetAttributeChangedSignal("Phase"):Connect(function()
 	end
 end)
 
+-- Hook restored egg tools in Backpack so they can be placed
+local function setupPlayerEggToolHook(player: Player)
+	local function checkItem(item: Instance)
+		if item:IsA("Tool") and item:GetAttribute("IsAnimeEgg") == true and not item:GetAttribute("ActivatedHooked") then
+			item:SetAttribute("ActivatedHooked", true)
+			item.Activated:Connect(function()
+				local pen = playerPenMap[player]
+				if not pen then return end
+				local char = player.Character
+				local root = char and char:FindFirstChild("HumanoidRootPart") :: BasePart?
+				if not root then return end
+				local dist = (root.Position - pen.EggArea.Position).Magnitude
+				local maxDist = math.max(25, pen.EggArea.Size.Magnitude / 2 + 10)
+				if dist <= maxDist then
+					local currentCount = getPlacedItemCount(pen)
+					if currentCount < GameplayConfig.Eggs.MaxPlacedCapacity then
+						local eggData = {
+							SizeTier = item:GetAttribute("SizeTier") or "Small",
+							Scale = item:GetAttribute("Scale") or 1.0,
+							Name = item:GetAttribute("TierName") or "Anime Egg",
+						}
+						local placed = placeEggInPen(player, pen, eggData)
+						if placed then
+							item:Destroy()
+							if _G.PlayerData and _G.PlayerData.removeEggFromInventory then
+								_G.PlayerData.removeEggFromInventory(player, eggData)
+							end
+						end
+					end
+				end
+			end)
+		end
+	end
+
+	local function hookBackpack(backpack: Instance)
+		for _, child in ipairs(backpack:GetChildren()) do
+			checkItem(child)
+		end
+		backpack.ChildAdded:Connect(checkItem)
+	end
+
+	local bp = player:FindFirstChild("Backpack")
+	if bp then hookBackpack(bp) end
+	player.ChildAdded:Connect(function(c)
+		if c.Name == "Backpack" then hookBackpack(c) end
+	end)
+end
+
 -- Player join/leave lifecycle
 Players.PlayerAdded:Connect(function(player: Player)
 	assignPenToPlayer(player)
+	setupPlayerEggToolHook(player)
 end)
 
 for _, p in ipairs(Players:GetPlayers()) do
 	assignPenToPlayer(p)
+	setupPlayerEggToolHook(p)
 end
 
 Players.PlayerRemoving:Connect(function(player: Player)
