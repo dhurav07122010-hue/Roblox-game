@@ -567,14 +567,26 @@ end
 
 local function getEquippedEggTool(): Tool?
 	local char = player.Character
-	if char then
-		for _, child in ipairs(char:GetChildren()) do
-			if child:IsA("Tool") and (child:GetAttribute("IsAnimeEgg") == true or child.Name:lower():find("egg")) then
-				return child
-			end
+	if not char then return nil end
+	for _, child in ipairs(char:GetChildren()) do
+		if child:IsA("Tool") and child:GetAttribute("IsAnimeEgg") == true then
+			return child
 		end
 	end
 	return nil
+end
+
+local function getSelectedEgg(): (string?, Tool?)
+	-- 1. Check if an egg tool is actively equipped in Character hand
+	local tool = getEquippedEggTool()
+	if tool then
+		return "EquippedTool:" .. tool.Name, tool
+	end
+	-- 2. Check if player is carrying an egg stolen from Zone 1
+	if player:GetAttribute("CarryingEgg") == true then
+		return "CarriedEgg", nil
+	end
+	return nil, nil
 end
 
 local function isGuiAtScreenPoint(screenX: number, screenY: number): boolean
@@ -592,98 +604,120 @@ end
 local lastPlaceRequestTime = 0
 local CLIENT_PLACE_DEBOUNCE = 0.12 -- 120ms debounce consolidates any overlapping engine events into exactly one request
 
-local function requestPlaceEgg(screenX: number?, screenY: number?)
-	-- 1. Strictly verify player has an egg selected (equipped tool or carried egg)
-	-- Never fire placement requests or consume inventory when unequipped
-	local tool = getEquippedEggTool()
-	local isCarrying = (player:GetAttribute("CarryingEgg") == true)
-	if not tool and not isCarrying then
-		return
-	end
+local function requestPlaceEgg(inputSource: string, screenX: number?, screenY: number?)
+	-- Checkpoint 1: Client detects a click/tap
+	print(string.format("[EGG_PLACE_DEBUG] [Checkpoint 1] Client detected click/tap (source: %s)", inputSource))
 
-	-- 2. Consolidate rapid overlapping input events
+	-- Debounce rapid overlapping engine events
 	local now = os.clock()
 	if (now - lastPlaceRequestTime) < CLIENT_PLACE_DEBOUNCE then
+		print(string.format("[EGG_PLACE_DEBUG] Client ignored: input debounced (%.3fs < %.2fs)", now - lastPlaceRequestTime, CLIENT_PLACE_DEBOUNCE))
 		return
 	end
 
-	-- 3. Screen coordinates & GUI blocking check
-	if not screenX or not screenY then
-		local mPos = UserInputService:GetMouseLocation()
-		screenX = mPos.X
-		screenY = mPos.Y
+	-- Screen coordinates & UI blocking check
+	if screenX and screenY then
+		if isGuiAtScreenPoint(screenX, screenY) then
+			print(string.format("[EGG_PLACE_DEBUG] [Checkpoint 2] Client rejected: Click at (%.1f, %.1f) intercepted by active UI", screenX, screenY))
+			return
+		end
 	end
 
-	if isGuiAtScreenPoint(screenX, screenY) then
+	-- Checkpoint 2: Client finds the selected egg
+	local eggDesc, eggTool = getSelectedEgg()
+	if not eggDesc then
+		print("[EGG_PLACE_DEBUG] [Checkpoint 2] Client rejected: No egg equipped in hand or carried on back")
 		return
 	end
 
-	-- 4. Raycast to find 3D target position
-	local hitPos: Vector3? = nil
+	-- Checkpoint 2: Compute raycast hit position
 	local camera = Workspace.CurrentCamera
-	if camera and screenX and screenY then
-		local unitRay = camera:ScreenPointToRay(screenX, screenY)
-		local rayParams = RaycastParams.new()
-		rayParams.FilterType = Enum.RaycastFilterType.Exclude
-
-		local filterList: { Instance } = {}
-		if player.Character then
-			table.insert(filterList, player.Character)
-		end
-		local nightBarriers = Workspace:FindFirstChild("NightBarriers") or Workspace:FindFirstChild("NightBarrier")
-		if nightBarriers then
-			table.insert(filterList, nightBarriers)
-		end
-		local barriers = Workspace:FindFirstChild("Barriers")
-		if barriers then
-			table.insert(filterList, barriers)
-		end
-		rayParams.FilterDescendantsInstances = filterList
-
-		local rayHit = Workspace:Raycast(unitRay.Origin, unitRay.Direction * 800, rayParams)
-		if rayHit then
-			hitPos = rayHit.Position
-		end
-	end
-
-	if not hitPos then
-		local mouse = player:GetMouse()
-		if mouse and mouse.Hit then
-			hitPos = mouse.Hit.Position
-		end
-	end
-
-	if not hitPos then
+	if not camera then
+		print("[EGG_PLACE_DEBUG] [Checkpoint 2] Client rejected: CurrentCamera missing")
 		return
 	end
 
+	local ray: Ray
+	if screenX and screenY then
+		ray = camera:ViewportPointToRay(screenX, screenY)
+	else
+		local mPos = UserInputService:GetMouseLocation()
+		ray = camera:ViewportPointToRay(mPos.X, mPos.Y)
+	end
+
+	local rayParams = RaycastParams.new()
+	rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+	local filterList: { Instance } = {}
+	if player.Character then
+		table.insert(filterList, player.Character)
+	end
+	local chars = Workspace:FindFirstChild("characters")
+	if chars then
+		table.insert(filterList, chars)
+	end
+	for _, otherPlayer in ipairs(Players:GetPlayers()) do
+		if otherPlayer ~= player and otherPlayer.Character then
+			table.insert(filterList, otherPlayer.Character)
+		end
+	end
+	local worldEggs = Workspace:FindFirstChild("WorldEggs")
+	if worldEggs then
+		table.insert(filterList, worldEggs)
+	end
+	local nightBarriers = Workspace:FindFirstChild("NightBarriers") or Workspace:FindFirstChild("NightBarrier", true)
+	if nightBarriers then
+		table.insert(filterList, nightBarriers)
+	end
+	local barriers = Workspace:FindFirstChild("Barriers")
+	if barriers then
+		table.insert(filterList, barriers)
+	end
+
+	rayParams.FilterDescendantsInstances = filterList
+	rayParams.RespectCanCollide = true
+
+	local rayResult = Workspace:Raycast(ray.Origin, ray.Direction * 1000, rayParams)
+	if not rayResult then
+		print("[EGG_PLACE_DEBUG] [Checkpoint 2] Client rejected: Camera raycast did not hit world surface")
+		return
+	end
+
+	local hitPos = rayResult.Position
+	print(string.format("[EGG_PLACE_DEBUG] [Checkpoint 2] Selected egg: %s, Raycast hit pos: (%.1f, %.1f, %.1f), HitPart: %s",
+		eggDesc, hitPos.X, hitPos.Y, hitPos.Z, rayResult.Instance and rayResult.Instance.Name or "None"))
+
+	-- Checkpoint 3: Client sends PlaceEggAtLocation
 	lastPlaceRequestTime = now
-	placeEggRemote:FireServer(hitPos, tool)
+	print(string.format("[EGG_PLACE_DEBUG] [Checkpoint 3] Client sends PlaceEggAtLocation to server (HitPos: %.1f, %.1f, %.1f, Tool: %s)",
+		hitPos.X, hitPos.Y, hitPos.Z, eggTool and eggTool.Name or "None (CarriedEgg)"))
+	placeEggRemote:FireServer(hitPos, eggTool)
 end
 
 -- Connect Desktop Mouse Click
 local clientMouse = player:GetMouse()
 clientMouse.Button1Down:Connect(function()
 	local mPos = UserInputService:GetMouseLocation()
-	requestPlaceEgg(mPos.X, mPos.Y)
+	requestPlaceEgg("Mouse.Button1Down", mPos.X, mPos.Y)
 end)
 
--- Connect Mobile / Tablet Touch Tap (Single clean event upon tapping the screen)
+-- Connect Mobile / Tablet Touch Tap
 UserInputService.TouchTap:Connect(function(touchPositions, gameProcessed)
 	if gameProcessed then return end
 	local pos = touchPositions[1]
 	if pos then
-		requestPlaceEgg(pos.X, pos.Y)
+		requestPlaceEgg("TouchTap", pos.X, pos.Y)
 	end
 end)
 
--- Hook equipped Tool Activated as a safety fallback for mobile tool tap buttons
+-- Hook equipped Tool Activated as an additional trigger when holding the tool
 local function hookEggToolClient(item: Instance)
-	if item:IsA("Tool") and (item:GetAttribute("IsAnimeEgg") == true or item.Name:lower():find("egg")) then
+	if item:IsA("Tool") and item:GetAttribute("IsAnimeEgg") == true then
 		if not item:GetAttribute("ClientActivatedHooked") then
 			item:SetAttribute("ClientActivatedHooked", true)
 			item.Activated:Connect(function()
-				requestPlaceEgg()
+				local mPos = UserInputService:GetMouseLocation()
+				requestPlaceEgg("Tool.Activated", mPos.X, mPos.Y)
 			end)
 		end
 	end

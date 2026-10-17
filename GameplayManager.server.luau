@@ -1827,6 +1827,19 @@ local function isPositionInsideZone(pos: Vector3, zoneName: string): boolean
 	end
 end
 
+local pendingEggRespawns: { [string]: thread } = {}
+
+local function isWorldEggNear(pos: Vector3, maxDist: number?): boolean
+	local dist = maxDist or 2.5
+	if not worldEggsFolder then return false end
+	for _, egg in ipairs(worldEggsFolder:GetChildren()) do
+		if (egg:GetPivot().Position - pos).Magnitude <= dist then
+			return true
+		end
+	end
+	return false
+end
+
 -- Spawn a single world egg at specified CFrame with full size, hitbox, prompt & touch pickup
 local function spawnSingleWorldEgg(sourceZone: string, spawnCF: CFrame, eggData: any): Model?
 	worldEggsFolder = getOrCreateWorldEggsFolder()
@@ -1862,7 +1875,8 @@ local function spawnSingleWorldEgg(sourceZone: string, spawnCF: CFrame, eggData:
 	newEgg:SetAttribute("SpeedMultiplier", speedMult)
 	newEgg:SetAttribute("TierName", tierName)
 	newEgg:SetAttribute("SourceZone", sourceZone)
-	newEgg:SetAttribute("HomeSpawnCFrame", spawnCF)
+	local originalHomeCF = (eggData and eggData.HomeSpawnCFrame) or spawnCF
+	newEgg:SetAttribute("HomeSpawnCFrame", originalHomeCF)
 
 	local rootHitbox = Instance.new("Part")
 	rootHitbox.Name = "EggHitbox"
@@ -1934,7 +1948,14 @@ local function dropCarriedEgg(player: Player)
 	if inOwnZone then
 		-- Returned to its original place/nest in its home zone
 		if homeSpawnCF then
-			spawnSingleWorldEgg(sourceZone, homeSpawnCF, eggData)
+			local spawnKey = string.format("%.1f_%.1f_%.1f", homeSpawnCF.Position.X, homeSpawnCF.Position.Y, homeSpawnCF.Position.Z)
+			if pendingEggRespawns[spawnKey] then
+				pcall(task.cancel, pendingEggRespawns[spawnKey])
+				pendingEggRespawns[spawnKey] = nil
+			end
+			if not isWorldEggNear(homeSpawnCF.Position, 2.0) then
+				spawnSingleWorldEgg(sourceZone, homeSpawnCF, eggData)
+			end
 		else
 			spawnZone1Eggs()
 		end
@@ -2290,24 +2311,34 @@ pickUpEgg = function(player: Player, worldEgg: Model)
 		end
 	end)
 
-	-- Respawn replacement world egg after 15s during Day (only if below total capacity)
-	task.delay(15, function()
+	local spawnKey = string.format("%.1f_%.1f_%.1f", homeSpawnCF.Position.X, homeSpawnCF.Position.Y, homeSpawnCF.Position.Z)
+	if pendingEggRespawns[spawnKey] then
+		pcall(task.cancel, pendingEggRespawns[spawnKey])
+		pendingEggRespawns[spawnKey] = nil
+	end
+
+	-- Respawn replacement world egg after 15s during Day (using saved HomeSpawnCFrame, strictly preventing duplicates)
+	pendingEggRespawns[spawnKey] = task.delay(15, function()
+		pendingEggRespawns[spawnKey] = nil
 		if Lighting:GetAttribute("Phase") == "DAY" then
 			worldEggsFolder = getOrCreateWorldEggsFolder()
 			local eggSpawns = findEggSpawnParts()
 			local maxAllowed = (#eggSpawns > 0 and (#eggSpawns * (GameplayConfig.Eggs.EggsPerSpawn or 10))) or (GameplayConfig.Eggs.Zone1SpawnCount or 15)
 			if #worldEggsFolder:GetChildren() < maxAllowed then
-				local tierKey, tierData = pickRandomEggTier()
-				local scale = tierData.Scale or 1.0
 				local targetCF = homeSpawnCF
+				if targetCF and isWorldEggNear(targetCF.Position, 2.0) then
+					return
+				end
 				if not targetCF and #eggSpawns > 0 then
 					local baseExtents = getEggExtents()
 					targetCF = getSpawnCFrameOnEggSpawn(eggSpawns[math.random(1, #eggSpawns)], baseExtents * scale)
 				end
-				if targetCF then
+				if targetCF and not isWorldEggNear(targetCF.Position, 2.0) then
+					local tierKey, tierData = pickRandomEggTier()
+					local eggScale = tierData.Scale or 1.0
 					spawnSingleWorldEgg(sourceZone or "Zone1", targetCF, {
 						SizeTier = tierKey,
-						Scale = scale,
+						Scale = eggScale,
 						Name = tierData.Name,
 						SpeedMultiplier = tierData.SpeedMultiplier,
 					})
@@ -2603,34 +2634,33 @@ end
 placeEggInPen = function(player: Player, penInfo: PenInfo, eggData: any?, customCFrame: CFrame?): boolean
 	local currentCount = getPlacedItemCount(penInfo)
 	if currentCount >= GameplayConfig.Eggs.MaxPlacedCapacity then
+		print(string.format("[EGG_PLACE_DEBUG] [Checkpoint 7] Server placement rejected: Pen #%d capacity reached (%d/%d) for %s",
+			penInfo.Index, currentCount, GameplayConfig.Eggs.MaxPlacedCapacity, player.Name))
 		showFloatingFeedback(player.Character and player.Character:GetPivot().Position or penInfo.EggArea.Position,
 			"❌ Pen Full! (30/30 Eggs placed)", Color3.fromRGB(255, 75, 75))
 		return false
 	end
 
 	local slotIndex = findNextFreeSlotIndex(penInfo)
-	if not slotIndex then return false end
+	if not slotIndex then
+		print(string.format("[EGG_PLACE_DEBUG] [Checkpoint 7] Server placement rejected: No available slot index in Pen #%d for %s",
+			penInfo.Index, player.Name))
+		return false
+	end
 
 	local eggArea = penInfo.EggArea
 	local scale = (eggData and tonumber(eggData.Scale)) or 1.0
-	local candidateRadius = math.max(1.8, 2.2 * scale)
 
 	local targetCFrame = customCFrame
 	if not targetCFrame then
-		local fx, fz = findNearbyFreePlatformSpot(penInfo, 0, 0, candidateRadius)
-		if not fx or not fz then
-			showFloatingFeedback(eggArea.Position + Vector3.new(0, 2, 0),
-				"Pen platform is full or too crowded!", Color3.fromRGB(255, 75, 75))
-			return false
-		end
-		local localY = (eggArea.Size.Y / 2) + (1.77 * scale) + 0.05
-		local worldPos = eggArea.CFrame:PointToWorldSpace(Vector3.new(fx, localY, fz))
-		local randYaw = math.rad(math.random(0, 360))
-		targetCFrame = CFrame.new(worldPos) * CFrame.Angles(0, randYaw, 0)
+		targetCFrame = calculateSlotCFrame(eggArea, slotIndex)
 	end
 
 	local eggPrototype = Workspace:FindFirstChild("egg")
-	if not eggPrototype then return false end
+	if not eggPrototype then
+		print(string.format("[EGG_PLACE_DEBUG] [Checkpoint 7] Server placement rejected: Workspace.egg prototype model not found for %s", player.Name))
+		return false
+	end
 
 	local placedEgg = eggPrototype:Clone()
 	placedEgg.Name = string.format("PlacedEgg_%d", slotIndex)
@@ -2652,7 +2682,15 @@ placeEggInPen = function(player: Player, penInfo: PenInfo, eggData: any?, custom
 	end
 	placedEgg:SetAttribute("Scale", scale)
 
-	placedEgg:PivotTo(targetCFrame)
+	-- Calculate exact height using pen surface and egg model bounds, so the egg rests flush on the platform
+	local bbCF, bbSize = placedEgg:GetBoundingBox()
+	local pivotPos = placedEgg:GetPivot().Position
+	local bottomRelPivot = (bbCF.Position.Y - (bbSize.Y / 2)) - pivotPos.Y
+	local platformTopY = eggArea.Position.Y + (eggArea.Size.Y / 2)
+	local correctedY = (platformTopY + 0.02) - bottomRelPivot
+
+	local finalCF = CFrame.new(targetCFrame.Position.X, correctedY, targetCFrame.Position.Z) * (targetCFrame - targetCFrame.Position)
+	placedEgg:PivotTo(finalCF)
 	placedEgg.Parent = penInfo.Model
 
 	local primary = placedEgg.PrimaryPart or placedEgg:FindFirstChildWhichIsA("BasePart", true)
@@ -2711,6 +2749,8 @@ placeEggInPen = function(player: Player, penInfo: PenInfo, eggData: any?, custom
 	end)
 
 	local eggName = (eggData and eggData.Name) or "Egg"
+	print(string.format("[EGG_PLACE_DEBUG] [Checkpoint 7] Server placement SUCCESS: Egg '%s' placed in Pen #%d at (%.1f, %.1f, %.1f) in slot %d for %s",
+		eggName, penInfo.Index, finalCF.Position.X, finalCF.Position.Y, finalCF.Position.Z, slotIndex, player.Name))
 	showFloatingFeedback(targetCFrame.Position, string.format("+1 %s Placed!", eggName), Color3.fromRGB(120, 255, 120))
 	return true
 end
@@ -2800,10 +2840,15 @@ end
 
 -- Connect PlaceEggAtLocation RemoteEvent (Tap anywhere in pen to place egg!)
 placeEggAtLocationRemote.OnServerEvent:Connect(function(player: Player, hitPosition: any, clientTool: any?)
-	if typeof(hitPosition) ~= "Vector3" then return end
+	-- Checkpoint 4: Server receives event and identifies player's pen
+	if typeof(hitPosition) ~= "Vector3" then
+		print(string.format("[EGG_PLACE_DEBUG] [Checkpoint 4] Server rejected: Invalid hitPosition type (%s) from %s", typeof(hitPosition), player.Name))
+		return
+	end
 
 	local pen = playerPenMap[player]
 	if not pen then
+		print(string.format("[EGG_PLACE_DEBUG] [Checkpoint 4] Server rejected: Player %s does not own a pen", player.Name))
 		showFloatingFeedback(player.Character and player.Character:GetPivot().Position or Vector3.zero,
 			"You don't own a pen yet!", Color3.fromRGB(255, 80, 80))
 		return
@@ -2812,14 +2857,8 @@ placeEggAtLocationRemote.OnServerEvent:Connect(function(player: Player, hitPosit
 	local char = player.Character
 	local root = char and char:FindFirstChild("HumanoidRootPart") :: BasePart?
 	local hum = char and char:FindFirstChildOfClass("Humanoid")
-	if not root or not hum or hum.Health <= 0 then return end
-
-	local penCF, penSize = pen.Model:GetBoundingBox()
-	local playerPenRel = penCF:PointToObjectSpace(root.Position)
-	local isPlayerInsidePen = (math.abs(playerPenRel.X) <= (penSize.X / 2) + 20.0) and (math.abs(playerPenRel.Z) <= (penSize.Z / 2) + 20.0)
-	local playerDist = (root.Position - pen.EggArea.Position).Magnitude
-	if not isPlayerInsidePen and playerDist > 120 then
-		showFloatingFeedback(root.Position + Vector3.new(0, 2.5, 0), "Too far from your pen!", Color3.fromRGB(255, 100, 100))
+	if not root or not hum or hum.Health <= 0 then
+		print(string.format("[EGG_PLACE_DEBUG] [Checkpoint 4] Server rejected: Player %s character missing or dead", player.Name))
 		return
 	end
 
@@ -2827,28 +2866,44 @@ placeEggAtLocationRemote.OnServerEvent:Connect(function(player: Player, hitPosit
 	local now = os.clock()
 	local last = lastPlaceTime[player] or 0
 	if (now - last) < 0.15 then
+		print(string.format("[EGG_PLACE_DEBUG] [Checkpoint 4] Server rejected: Rate limit (%.3fs < 0.15s) for %s", now - last, player.Name))
 		return
 	end
 	lastPlaceTime[player] = now
+
+	print(string.format("[EGG_PLACE_DEBUG] [Checkpoint 4] Server received event from %s. Identified Pen #%d", player.Name, pen.Index))
+
+	-- Checkpoint 5: Server validates hit position and identifies egg Tool or carried egg
+	local penCF, penSize = pen.Model:GetBoundingBox()
+	local playerPenRel = penCF:PointToObjectSpace(root.Position)
+	local isPlayerInsidePen = (math.abs(playerPenRel.X) <= (penSize.X / 2) + 20.0) and (math.abs(playerPenRel.Z) <= (penSize.Z / 2) + 20.0)
+	local playerDist = (root.Position - pen.EggArea.Position).Magnitude
+	if not isPlayerInsidePen and playerDist > 120 then
+		print(string.format("[EGG_PLACE_DEBUG] [Checkpoint 5] Server rejected: Player %s too far from pen (dist: %.1f > 120)", player.Name, playerDist))
+		showFloatingFeedback(root.Position + Vector3.new(0, 2.5, 0), "Too far from your pen!", Color3.fromRGB(255, 100, 100))
+		return
+	end
 
 	local eggArea = pen.EggArea
 	local rel = eggArea.CFrame:PointToObjectSpace(hitPosition)
 	local halfX = eggArea.Size.X / 2
 	local halfZ = eggArea.Size.Z / 2
+	local halfY = eggArea.Size.Y / 2
 
-	-- Validate that the clicked position is inside the player's pen or near egg area
-	local penRel = penCF:PointToObjectSpace(hitPosition)
-	local isInsidePen = (math.abs(penRel.X) <= (penSize.X / 2) + 12.0) and (math.abs(penRel.Z) <= (penSize.Z / 2) + 12.0)
-	local isNearEggArea = (math.abs(rel.X) <= (halfX + 12.0)) and (math.abs(rel.Z) <= (halfZ + 12.0))
-
-	if not isInsidePen and not isNearEggArea then
-		showFloatingFeedback(hitPosition, "Tap inside your pen to place this egg!", Color3.fromRGB(255, 200, 80))
+	-- Confirm the player is tapping the actual pen surface, not just a point with similar X/Z at another height
+	local heightDelta = math.abs(rel.Y - halfY)
+	if heightDelta > 4.5 or math.abs(rel.X) > (halfX + 2.5) or math.abs(rel.Z) > (halfZ + 2.5) then
+		print(string.format("[EGG_PLACE_DEBUG] [Checkpoint 5] Server rejected: Hit pos not on pen platform! Rel: (%.1f, %.1f, %.1f), PlatformSize: (%.1f, %.1f, %.1f), HeightDelta: %.1f",
+			rel.X, rel.Y, rel.Z, eggArea.Size.X, eggArea.Size.Y, eggArea.Size.Z, heightDelta))
+		showFloatingFeedback(hitPosition, "Tap inside your pen platform to place this egg!", Color3.fromRGB(255, 200, 80))
 		return
 	end
 
 	-- Check pen capacity BEFORE consuming any egg
 	local currentPlaced = getPlacedItemCount(pen)
 	if currentPlaced >= GameplayConfig.Eggs.MaxPlacedCapacity then
+		print(string.format("[EGG_PLACE_DEBUG] [Checkpoint 5] Server rejected: Pen #%d is full (%d/%d)",
+			pen.Index, currentPlaced, GameplayConfig.Eggs.MaxPlacedCapacity))
 		showFloatingFeedback(eggArea.Position + Vector3.new(0, 2, 0),
 			string.format("❌ Pen Full! (%d/%d Eggs placed)", currentPlaced, GameplayConfig.Eggs.MaxPlacedCapacity),
 			Color3.fromRGB(255, 75, 75))
@@ -2856,20 +2911,18 @@ placeEggAtLocationRemote.OnServerEvent:Connect(function(player: Player, hitPosit
 	end
 
 	-- Strictly identify the SELECTED egg:
-	-- 1. Check if clientTool is a valid Tool equipped in player.Character or inside Backpack
+	-- Must be an equipped Tool with attribute IsAnimeEgg == true OR an active carried egg
 	local eggTool: Tool? = nil
 	if clientTool and typeof(clientTool) == "Instance" and clientTool:IsA("Tool") then
-		if clientTool.Parent == char or clientTool.Parent == player:FindFirstChild("Backpack") then
-			if clientTool:GetAttribute("IsAnimeEgg") == true or clientTool.Name:lower():find("egg") then
-				eggTool = clientTool
-			end
+		if clientTool.Parent == char and clientTool:GetAttribute("IsAnimeEgg") == true then
+			eggTool = clientTool
 		end
 	end
 
-	-- 2. Fallback to any egg tool currently equipped in player.Character
+	-- Fallback to any actively equipped egg tool currently in player.Character
 	if not eggTool and char then
 		for _, item in ipairs(char:GetChildren()) do
-			if item:IsA("Tool") and (item:GetAttribute("IsAnimeEgg") == true or item.Name:lower():find("egg")) then
+			if item:IsA("Tool") and item:GetAttribute("IsAnimeEgg") == true then
 				eggTool = item
 				break
 			end
@@ -2895,32 +2948,89 @@ placeEggAtLocationRemote.OnServerEvent:Connect(function(player: Player, hitPosit
 	-- If the player has neither an equipped egg tool nor a carried egg, refuse placement!
 	-- Never silently grab an unselected egg from inventory!
 	if not eggData then
-		showFloatingFeedback(hitPosition, "Equip or carry an egg to place it!", Color3.fromRGB(255, 200, 80))
+		local hasBackpackEgg = false
+		local bp = player:FindFirstChild("Backpack")
+		if bp then
+			for _, item in ipairs(bp:GetChildren()) do
+				if item:IsA("Tool") and item:GetAttribute("IsAnimeEgg") == true then
+					hasBackpackEgg = true
+					break
+				end
+			end
+		end
+		if not hasBackpackEgg and _G.PlayerData and _G.PlayerData.getEggInventoryCount then
+			hasBackpackEgg = (_G.PlayerData.getEggInventoryCount(player) > 0)
+		end
+
+		if hasBackpackEgg then
+			print(string.format("[EGG_PLACE_DEBUG] [Checkpoint 5] Server rejected: Player %s has eggs in backpack but none equipped in hand", player.Name))
+			showFloatingFeedback(hitPosition, "Equip an egg from your backpack to place it!", Color3.fromRGB(255, 200, 80))
+		else
+			print(string.format("[EGG_PLACE_DEBUG] [Checkpoint 5] Server rejected: Player %s has no eggs to place", player.Name))
+			showFloatingFeedback(hitPosition, "You have no eggs to place!", Color3.fromRGB(255, 200, 80))
+		end
 		return
 	end
 
-	local scale = tonumber(eggData.Scale) or 1.0
-	local candidateRadius = math.max(1.8, 2.2 * scale)
+	print(string.format("[EGG_PLACE_DEBUG] [Checkpoint 5] Hit pos validated. Egg identified: %s (Tier: %s, Scale: %.2f, Source: %s)",
+		eggData.Name, eggData.SizeTier, eggData.Scale, eggTool and ("Tool:" .. eggTool.Name) or "CarriedEgg"))
 
-	-- Check if spot is occupied and find nearby free position if needed
-	local freeX, freeZ = findNearbyFreePlatformSpot(pen, rel.X, rel.Z, candidateRadius)
-	if not freeX or not freeZ then
-		local marginX = math.max(1.2, candidateRadius * 0.7)
-		local marginZ = math.max(1.2, candidateRadius * 0.7)
-		local usableX = math.max(1, halfX - marginX)
-		local usableZ = math.max(1, halfZ - marginZ)
-		freeX = math.clamp(rel.X, -usableX, usableX)
-		freeZ = math.clamp(rel.Z, -usableZ, usableZ)
+	local scale = tonumber(eggData.Scale) or 1.0
+	local baseExtents = getEggExtents()
+	local eggExtents = baseExtents * scale
+
+	-- Convert target position into EggArea local coordinate space and clamp to safe bounds
+	local marginX = math.max(0.8, (eggExtents.X / 2) + 0.2)
+	local marginZ = math.max(0.8, (eggExtents.Z / 2) + 0.2)
+	local usableX = math.max(0.5, halfX - marginX)
+	local usableZ = math.max(0.5, halfZ - marginZ)
+	local clampedX = math.clamp(rel.X, -usableX, usableX)
+	local clampedZ = math.clamp(rel.Z, -usableZ, usableZ)
+
+	-- Check if spot is occupied
+	local candidateRadius = math.max(1.8, 2.2 * scale)
+	local finalX, finalZ = clampedX, clampedZ
+	local isClear = isPlatformSpotClear(pen, clampedX, clampedZ, candidateRadius)
+
+	if not isClear then
+		-- Minimal adjustment: slight nudge up to 1.5 studs around tapped location
+		local adjusted = false
+		local testOffsets = {
+			Vector2.new(1.5, 0), Vector2.new(-1.5, 0),
+			Vector2.new(0, 1.5), Vector2.new(0, -1.5),
+			Vector2.new(1.2, 1.2), Vector2.new(-1.2, 1.2),
+			Vector2.new(1.2, -1.2), Vector2.new(-1.2, -1.2),
+		}
+		for _, off in ipairs(testOffsets) do
+			local tx = math.clamp(clampedX + off.X, -usableX, usableX)
+			local tz = math.clamp(clampedZ + off.Y, -usableZ, usableZ)
+			if isPlatformSpotClear(pen, tx, tz, candidateRadius) then
+				finalX, finalZ = tx, tz
+				adjusted = true
+				break
+			end
+		end
+
+		if not adjusted then
+			print(string.format("[EGG_PLACE_DEBUG] [Checkpoint 7] Server placement rejected: Location (%.1f, %.1f) is occupied by another egg", clampedX, clampedZ))
+			showFloatingFeedback(hitPosition, "⚠️ Spot is occupied! Tap an open area.", Color3.fromRGB(255, 180, 60))
+			return
+		end
 	end
 
-	-- Upright CFrame with bottom sitting just above the platform floor
-	local localY = (eggArea.Size.Y / 2) + (1.77 * scale) + 0.05
-	local worldPos = eggArea.CFrame:PointToWorldSpace(Vector3.new(freeX, localY, freeZ))
+	-- Calculate the correct height using pen surface and egg model bounds so egg rests on platform
+	local localY = halfY + (eggExtents.Y / 2) + 0.02
+	local worldPos = eggArea.CFrame:PointToWorldSpace(Vector3.new(finalX, localY, finalZ))
 	local randYaw = math.rad(math.random(0, 360))
 	local targetCFrame = CFrame.new(worldPos) * CFrame.Angles(0, randYaw, 0)
 
+	-- Checkpoint 6: Server attempts placeEggInPen
+	print(string.format("[EGG_PLACE_DEBUG] [Checkpoint 6] Server attempting placeEggInPen for %s at (%.1f, %.1f, %.1f)",
+		player.Name, worldPos.X, worldPos.Y, worldPos.Z))
+
 	local placed = placeEggInPen(player, pen, eggData, targetCFrame)
 	if placed then
+		-- Only consume the egg and clear carried state AFTER placeEggInPen succeeds!
 		if eggTool and eggTool.Parent then
 			eggTool:Destroy()
 		end
@@ -2940,6 +3050,8 @@ placeEggAtLocationRemote.OnServerEvent:Connect(function(player: Player, hitPosit
 			end
 		end
 		showFloatingFeedback(worldPos + Vector3.new(0, 2.5, 0), "🥚 Egg Placed!", Color3.fromRGB(80, 255, 120))
+	else
+		print(string.format("[EGG_PLACE_DEBUG] [Checkpoint 7] Server placement rejected: placeEggInPen returned false for %s", player.Name))
 	end
 end)
 
@@ -3126,8 +3238,12 @@ spawnZone1Eggs = function()
 
 		for _, spawnPart in ipairs(eggSpawnParts) do
 			local existingCount = 0
+			local halfX = spawnPart.Size.X / 2
+			local halfZ = spawnPart.Size.Z / 2
+			local halfY = spawnPart.Size.Y / 2
 			for _, egg in ipairs(worldEggsFolder:GetChildren()) do
-				if (egg:GetPivot().Position - spawnPart.Position).Magnitude < math.max(spawnPart.Size.Magnitude, 15) then
+				local localP = spawnPart.CFrame:PointToObjectSpace(egg:GetPivot().Position)
+				if math.abs(localP.X) <= (halfX + 0.2) and math.abs(localP.Z) <= (halfZ + 0.2) and math.abs(localP.Y - halfY) <= 4.0 then
 					existingCount += 1
 				end
 			end
@@ -3137,11 +3253,17 @@ spawnZone1Eggs = function()
 				local tierKey, tierData = pickRandomEggTier()
 				local scale = tierData.Scale or 1.0
 				local eggExtents = baseExtents * scale
-				local spawnCF: CFrame? = getSpawnCFrameOnEggSpawn(spawnPart, eggExtents)
 
-				if barrier and isOverlappingNightBarrier(spawnCF.Position, eggExtents, barrier) then
-					local safePos = zoneArea and findSafeZone1FloorSpawn(zoneArea, barrier, eggExtents)
-					spawnCF = safePos and CFrame.new(safePos) or nil
+				-- Keep eggs strictly on valid designated spawn part; if blocked by barrier, retry locally or skip!
+				-- Never fall back to scattering eggs across the whole Zone1 floor.
+				local spawnCF: CFrame? = nil
+				for _ = 1, 8 do
+					local testCF = getSpawnCFrameOnEggSpawn(spawnPart, eggExtents)
+					local blocked = (barrier and isOverlappingNightBarrier(testCF.Position, eggExtents, barrier))
+					if not blocked and not isWorldEggNear(testCF.Position, 2.0) then
+						spawnCF = testCF
+						break
+					end
 				end
 
 				if spawnCF then
@@ -3150,6 +3272,7 @@ spawnZone1Eggs = function()
 						Scale = scale,
 						Name = tierData.Name,
 						SpeedMultiplier = tierData.SpeedMultiplier,
+						HomeSpawnCFrame = spawnCF,
 					})
 				end
 			end
