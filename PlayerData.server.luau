@@ -465,28 +465,17 @@ end
 
 -- Gather current egg inventory from held tools or fallback to memory
 local function serializeEggInventory(player: Player): { any }
+	-- EggInventory is the authoritative server-side record. Tools are only its
+	-- physical representation; using them as the source of truth can silently
+	-- drop saved eggs when a Backpack/Character update is in flight.
 	local d = data[player]
 	local eggs = {}
-	local foundTools = false
-
-	local containers = { player:FindFirstChild("Backpack"), player.Character }
-	for _, container in ipairs(containers) do
-		if container then
-			for _, item in ipairs(container:GetChildren()) do
-				if item:IsA("Tool") and item:GetAttribute("IsAnimeEgg") == true then
-					foundTools = true
-					table.insert(eggs, {
-						SizeTier = item:GetAttribute("SizeTier") or "Small",
-						Scale = tonumber(item:GetAttribute("Scale")) or 1.0,
-						Name = tostring(item:GetAttribute("TierName") or item.Name or "Anime Egg"),
-					})
-				end
-			end
-		end
+	if not d or type(d.EggInventory) ~= "table" then
+		return eggs
 	end
 
-	if not foundTools and d and type(d.EggInventory) == "table" then
-		for _, e in ipairs(d.EggInventory) do
+	for _, e in ipairs(d.EggInventory) do
+		if type(e) == "table" then
 			table.insert(eggs, {
 				SizeTier = tostring(e.SizeTier or "Small"),
 				Scale = tonumber(e.Scale) or 1.0,
@@ -494,7 +483,6 @@ local function serializeEggInventory(player: Player): { any }
 			})
 		end
 	end
-
 	return eggs
 end
 
@@ -502,28 +490,48 @@ end
 -- PLAYER LIFECYCLE & PERSISTENCE SAFETY
 --------------------------------------------------
 
+local saveInProgress: { [Player]: boolean } = {}
+
 local function savePlayerData(player: Player): boolean
+	-- Serialize writes per player so autosave, leave, and shutdown cannot
+	-- complete out of order and overwrite a newer snapshot with an older one.
+	local waitElapsed = 0
+	while saveInProgress[player] and waitElapsed < 10 do
+		task.wait(0.1)
+		waitElapsed += 0.1
+	end
+
 	local d = data[player]
 	if not d then return false end
 
-	-- CRITICAL: Refuse to overwrite valid cloud data if load had failed
+	-- CRITICAL: Refuse to overwrite valid cloud data if load had failed.
 	if dataLoadedSuccessfully[player] == false then
 		warn(string.format("[PlayerData] OVERWRITE PROTECTION ACTIVE for user %s (%d). Skipping DataStore save to prevent progress wipe.", player.Name, player.UserId))
 		return false
 	end
 
-	local arr = {}
-	for id in pairs(d.OwnedTrails) do table.insert(arr, id) end
-	local eggList = serializeEggInventory(player)
-	return saveData(player.UserId, {
-		Strength = d.Strength,
-		Money = d.Money,
-		PenUpgradeLevel = d.PenUpgradeLevel,
-		SpeedTier = d.SpeedTier,
-		Trail = d.Trail,
-		OwnedTrails = arr,
-		EggInventory = eggList,
-	})
+	saveInProgress[player] = true
+	local ok, result = pcall(function()
+		local arr = {}
+		for id in pairs(d.OwnedTrails) do table.insert(arr, id) end
+		local eggList = serializeEggInventory(player)
+		return saveData(player.UserId, {
+			Strength = d.Strength,
+			Money = d.Money,
+			PenUpgradeLevel = d.PenUpgradeLevel,
+			SpeedTier = d.SpeedTier,
+			Trail = d.Trail,
+			OwnedTrails = arr,
+			EggInventory = eggList,
+		})
+	end)
+	saveInProgress[player] = nil
+
+	if not ok then
+		warn(string.format("[PlayerData] Unexpected error while saving %s: %s", player.Name, tostring(result)))
+		return false
+	end
+	return result == true
 end
 
 local function onPlayerAdded(player: Player)
@@ -557,6 +565,8 @@ local function onPlayerAdded(player: Player)
 
 	local tierConfig = ShopConfig.SpeedTiers[data[player].SpeedTier]
 	player:SetAttribute("BaseSpeed", tierConfig and tierConfig.WalkSpeed or 16)
+	player:SetAttribute("PenUpgradeLevel", data[player].PenUpgradeLevel or 0)
+	player:SetAttribute("EquippedPetLimit", 6 + math.clamp(data[player].PenUpgradeLevel or 0, 0, 5))
 
 	player.CharacterAdded:Connect(function(character)
 		task.defer(function()
@@ -592,8 +602,18 @@ end
 Players.PlayerRemoving:Connect(onPlayerRemoving)
 
 game:BindToClose(function()
+	local activeSaves = 0
 	for p, _ in pairs(data) do
-		savePlayerData(p)
+		activeSaves += 1
+		task.spawn(function()
+			pcall(savePlayerData, p)
+			activeSaves -= 1
+		end)
+	end
+	local elapsed = 0
+	while activeSaves > 0 and elapsed < 25 do
+		task.wait(0.1)
+		elapsed += 0.1
 	end
 end)
 
@@ -684,6 +704,8 @@ _G.PlayerData = {
 		local d = data[player]
 		if not d then return false end
 		d.PenUpgradeLevel = math.clamp(math.floor(level), 0, 5)
+		player:SetAttribute("PenUpgradeLevel", d.PenUpgradeLevel)
+		player:SetAttribute("EquippedPetLimit", 6 + d.PenUpgradeLevel)
 		return true
 	end,
 	getEquippedPetLimit = function(player: Player): number
@@ -741,8 +763,11 @@ _G.PlayerData = {
 				end
 			end
 		end
+		-- Never consume a different egg when the requested egg cannot be
+		-- matched. A failed match is safer than silently deleting inventory.
 		if not removeIdx then
-			removeIdx = #d.EggInventory
+			warn("[PlayerData] Refused to remove egg: no matching inventory entry for " .. player.Name)
+			return nil
 		end
 		local egg = table.remove(d.EggInventory, removeIdx)
 		player:SetAttribute("EggCount", #d.EggInventory)
